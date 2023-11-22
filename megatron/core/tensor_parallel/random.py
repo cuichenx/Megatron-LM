@@ -243,7 +243,7 @@ class CheckpointFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-def checkpoint(function, distribute_saved_activations, *args):
+def checkpoint(function, distribute_saved_activations, *args, **kwargs):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
-    return CheckpointFunction.apply(function, distribute_saved_activations, *args)
+    return CheckpointFunction.apply(function, distribute_saved_activations, *args, **kwargs)

@@ -137,6 +137,7 @@ class GPTModel(MegatronModule):
         decoder_input: Tensor = None,
         labels: Tensor = None,
         inference_params=None,
+        **packed_seq_kwargs,
     ):
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -174,6 +175,7 @@ class GPTModel(MegatronModule):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            **packed_seq_kwargs,
         )
 
         if not self.post_process:

@@ -66,20 +66,20 @@ class Attention(MegatronModule, ABC):
         )
 
     def _checkpointed_attention_forward(
-        self, query, key, value, attention_mask, rotary_pos_emb=None
+        self, query, key, value, attention_mask, rotary_pos_emb=None, **packed_seq_kwargs
     ):
         """Forward method with selective activation checkpointing."""
 
-        def custom_forward(*inputs):
+        def custom_forward(*inputs, **kwargs):
             query = inputs[0]
             key = inputs[1]
             value = inputs[2]
             attention_mask = inputs[3]
-            output_ = self.dot_product_attention(query, key, value, attention_mask)
+            output_ = self.dot_product_attention(query, key, value, attention_mask, **kwargs)
             return output_
 
         hidden_states = tensor_parallel.checkpoint(
-            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb
+            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb, **packed_seq_kwargs
         )
 
         return hidden_states
@@ -180,6 +180,7 @@ class Attention(MegatronModule, ABC):
         key_value_states=None,
         inference_params=None,
         rotary_pos_emb=None,
+        **packed_seq_kwargs,
     ):
         # hidden_states: [sq, b, h]
 
@@ -228,10 +229,22 @@ class Attention(MegatronModule, ABC):
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
         )
 
+        if packed_seq_kwargs:
+            # sbhd (b=1) -> thd
+            query = query.squeeze(1)
+            key = key.squeeze(1)
+            value = value.squeeze(1)
+
         if self.checkpoint_dot_product_attention:
-            core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask)
+            core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask, **packed_seq_kwargs)
         else:
-            core_attn_out = self.dot_product_attention(query, key, value, attention_mask)
+            core_attn_out = self.dot_product_attention(query, key, value, attention_mask, **packed_seq_kwargs)
+
+        if packed_seq_kwargs:
+            # reshape to same output shape as unpacked case. assumes b=1.
+            # (2047, 1, 4096)
+            # (2047, 32, 128)
+            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
 
         # =================
         # Output. [sq, b, h]

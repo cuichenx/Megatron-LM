@@ -110,6 +110,7 @@ class TransformerLayer(MegatronModule):
         enc_dec_attn_mask=None,
         inference_params=None,
         rotary_pos_emb=None,
+        **packed_seq_kwargs,
     ):
         # hidden_states: [s, b, h]
 
@@ -121,6 +122,7 @@ class TransformerLayer(MegatronModule):
             attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            **packed_seq_kwargs,
         )
 
         # Residual connection.

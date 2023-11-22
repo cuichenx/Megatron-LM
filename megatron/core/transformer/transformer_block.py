@@ -119,7 +119,7 @@ class TransformerBlock(MegatronModule):
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
 
-    def _checkpointed_forward(self, hidden_states, attention_mask, rotary_pos_emb):
+    def _checkpointed_forward(self, hidden_states, attention_mask, rotary_pos_emb, **packed_seq_kwargs):
         """Forward method with activation checkpointing."""
 
         def custom(start, end):
@@ -144,6 +144,7 @@ class TransformerBlock(MegatronModule):
                     hidden_states,
                     attention_mask,
                     rotary_pos_emb,
+                    **packed_seq_kwargs,
                 )
 
                 l += self.config.recompute_num_layers
@@ -160,9 +161,11 @@ class TransformerBlock(MegatronModule):
                         hidden_states,
                         attention_mask,
                         rotary_pos_emb,
+                        **packed_seq_kwargs,
                     )
                 else:
-                    hidden_states = custom(l, l + 1)(hidden_states, attention_mask, rotary_pos_emb)
+                    hidden_states = custom(l, l + 1)(hidden_states, attention_mask, rotary_pos_emb,
+                                                     **packed_seq_kwargs)
         else:
             raise ValueError("Invalid activation recompute method.")
 
@@ -178,7 +181,8 @@ class TransformerBlock(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
-    def forward(self, hidden_states, attention_mask, inference_params=None, rotary_pos_emb=None):
+    def forward(self, hidden_states, attention_mask, inference_params=None, rotary_pos_emb=None,
+                **packed_seq_kwargs,):
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
 
@@ -244,6 +248,7 @@ class TransformerBlock(MegatronModule):
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     rotary_pos_emb=rotary_pos_emb,
+                    **packed_seq_kwargs,
                 )
             else:
                 for layer in self.layers:
@@ -252,6 +257,7 @@ class TransformerBlock(MegatronModule):
                         attention_mask=attention_mask,
                         rotary_pos_emb=rotary_pos_emb,
                         inference_params=inference_params,
+                        **packed_seq_kwargs,
                     )
 
         # Final layer norm.
