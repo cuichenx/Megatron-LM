@@ -209,6 +209,47 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
                 setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
 
 
+def update_expert_bias(tokens_per_expert, expert_bias, expert_bias_udpate_rate):
+    """Update expert bias for biased expert routing. See https://arxiv.org/abs/2408.15664v1#
+
+    Args:
+        tokens_per_expert (torch.Tensor): The number of tokens assigned to each expert.
+        expert_bias (torch.Tensor): The bias for each expert.
+        expert_bias_udpate_rate (float): The update rate for the expert bias.
+    """
+    with torch.no_grad():
+        # All Reduce Across TPxEPxCPxDP ranks
+        torch.distributed.all_reduce(
+            tokens_per_expert,
+            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
+        )
+        average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
+        offset = tokens_per_expert - average_tokens
+        updated_expert_bias = expert_bias - torch.sign(offset) * expert_bias_udpate_rate
+        return updated_expert_bias
+
+
+def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
+    if config.moe_router_enable_expert_bias:
+        tokens_per_expert_list = []
+        expert_bias_list = []
+        for model_chunk in model:
+            for module in get_attr_wrapped_model(model_chunk, 'modules')():
+                if hasattr(module, 'expert_bias'):
+                    tokens_per_expert_list.append(module.local_tokens_per_expert)
+                    expert_bias_list.append(module.expert_bias)
+        stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
+        stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
+        stacked_updated_expert_bias = update_expert_bias(
+            stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
+        )
+
+        for tokens_per_expert, expert_bias, updated_expert_bias in zip(
+            tokens_per_expert_list, expert_bias_list, stacked_updated_expert_bias
+        ):
+            tokens_per_expert.zero_()
+            expert_bias.copy_(updated_expert_bias)
+
 def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torch.Tensor] = None):
     """
     All-reduce all model grads across DP replicas, layernorm grads for sequence parallelism,
@@ -252,6 +293,8 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     _allreduce_embedding_grads(model, config)
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
+
+    _update_router_expert_bias(model, config)
 
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number
