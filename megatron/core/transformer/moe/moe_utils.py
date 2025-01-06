@@ -600,3 +600,23 @@ def track_moe_metrics(
                     )
 
     clear_aux_losses_tracker()
+
+
+def update_expert_bias(tokens_per_expert, expert_bias, expert_bias_udpate_rate):
+    """Update expert bias for biased expert routing. See https://arxiv.org/abs/2408.15664v1#
+
+    Args:
+        tokens_per_expert (torch.Tensor): The number of tokens assigned to each expert.
+        expert_bias (torch.Tensor): The bias for each expert.
+        expert_bias_udpate_rate (float): The update rate for the expert bias.
+    """
+    with torch.no_grad():
+        # All Reduce Across TPxEPxCPxDP ranks
+        torch.distributed.all_reduce(
+            tokens_per_expert,
+            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
+        )
+        average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
+        offset = tokens_per_expert - average_tokens
+        updated_expert_bias = expert_bias - torch.sign(offset) * expert_bias_udpate_rate
+        return updated_expert_bias

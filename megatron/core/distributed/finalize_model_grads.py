@@ -15,6 +15,7 @@ except ImportError:
 from .. import parallel_state
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
+from ..transformer.moe.moe_utils import update_expert_bias
 
 
 def _unshard_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
@@ -207,26 +208,6 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
                 grad_attr = "main_grad" if hasattr(param, "main_grad") else "grad"
                 orig_grad = getattr(param, grad_attr)
                 setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
-
-
-def update_expert_bias(tokens_per_expert, expert_bias, expert_bias_udpate_rate):
-    """Update expert bias for biased expert routing. See https://arxiv.org/abs/2408.15664v1#
-
-    Args:
-        tokens_per_expert (torch.Tensor): The number of tokens assigned to each expert.
-        expert_bias (torch.Tensor): The bias for each expert.
-        expert_bias_udpate_rate (float): The update rate for the expert bias.
-    """
-    with torch.no_grad():
-        # All Reduce Across TPxEPxCPxDP ranks
-        torch.distributed.all_reduce(
-            tokens_per_expert,
-            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
-        )
-        average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
-        offset = tokens_per_expert - average_tokens
-        updated_expert_bias = expert_bias - torch.sign(offset) * expert_bias_udpate_rate
-        return updated_expert_bias
 
 
 def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
