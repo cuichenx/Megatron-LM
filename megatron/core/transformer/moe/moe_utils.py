@@ -313,6 +313,51 @@ def device_limited_topk(
     return probs, top_indices
 
 
+def node_limited_topk(
+    scores: torch.Tensor,
+    topk: int,
+    num_tokens: int,
+    num_experts: int,
+    moe_router_topk_limited_nodes: int,
+):
+    """Perform top-k routing on a subset of expert parallel nodes.
+
+    Selects N nodes for each token, then conducts top-k selection among experts on these nodes.
+    See DeepSeek-V3 technical report (https://arxiv.org/pdf/2412.19437) for details.
+
+    Args:
+        scores (torch.Tensor): Softmax scores from the router.
+        topk (int): The number of experts to select for each token.
+        num_tokens (int): The number of tokens.
+        num_experts (int): The number of experts.
+        moe_router_topk_limited_nodes (int): Number of expert parallel nodes to consider for
+            each token during routing. None means no node limitation.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
+    """
+    # Organize the experts into groups
+    num_group = (
+        parallel_state.get_expert_model_parallel_world_size() // torch.cuda.device_count()
+    )  # num_groups indicates the number of nodes utilized by a single expert model parallel group
+    group_scores = scores.view(num_tokens, num_group, -1).topk(2, dim=-1)[0].sum(dim = -1)
+    group_idx = torch.topk(group_scores, k=moe_router_topk_limited_nodes, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+
+    # Mask the experts based on selection groups
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_tokens, num_group, num_experts // num_group)
+        .reshape(num_tokens, -1)
+    )
+
+    masked_scores = scores.masked_fill(~score_mask.bool(), 0.0)
+    probs, top_indices = torch.topk(masked_scores, k=topk, dim=-1)
+
+    return probs, top_indices
+
+
 def topk_softmax_with_capacity(
     logits: torch.Tensor,
     topk: int,
@@ -321,6 +366,7 @@ def topk_softmax_with_capacity(
     drop_policy: str = "probs",
     use_pre_softmax: bool = False,
     moe_router_topk_limited_devices: int = None,
+    moe_router_topk_limited_nodes: int = None,
     moe_router_topk_scaling_factor: float = None,
     deterministic_mode: bool = False,
 ):
@@ -337,9 +383,12 @@ def topk_softmax_with_capacity(
         use_pre_softmax (bool): Whether to apply softmax before top-k selection.
         moe_router_topk_limited_devices (int): Number of expert parallel ranks to consider for
             each token during routing. None means no device limitation.
+        moe_router_topk_limited_nodes (int): Number of expert parallel nodes to consider for
+            each token during routing. None means no node limitation.
         moe_router_topk_scaling_factor (float): Scaling factor for routing score in top-k
             selection, only works when use_pre_softmax enabled.
         deterministic_mode (bool): Deprecated.
+
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
@@ -361,6 +410,10 @@ def topk_softmax_with_capacity(
             probs, top_indices = device_limited_topk(
                 scores, topk, num_tokens, num_experts, moe_router_topk_limited_devices
             )
+        elif moe_router_topk_limited_nodes:
+            probs, top_indices = node_limited_topk(
+                scores, topk, num_tokens, num_experts, moe_router_topk_limited_nodes
+            )
         else:
             probs, top_indices = torch.topk(scores, k=topk, dim=1)
 
@@ -379,6 +432,10 @@ def topk_softmax_with_capacity(
         if moe_router_topk_limited_devices:
             scores, top_indices = device_limited_topk(
                 logits, topk, num_tokens, num_experts, moe_router_topk_limited_devices
+            )
+        elif moe_router_topk_limited_nodes:
+            scores, top_indices = node_limited_topk(
+                scores, topk, num_tokens, num_experts, moe_router_topk_limited_nodes
             )
         else:
             scores, top_indices = torch.topk(logits, k=topk, dim=1)

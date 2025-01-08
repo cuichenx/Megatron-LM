@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
+import torch
 import torch.nn.functional as F
 
 from megatron.core.transformer.enums import AttnBackend
@@ -281,6 +282,11 @@ class TransformerConfig(ModelParallelConfig):
     """Number of expert parallel ranks to consider for each token during routing. Perform top-k
     routing on a subset of expert parallel ranks by first selecting N ranks for each token, then
     conducting top-k selection among experts on these devices. None means no device limitation."""
+
+    moe_router_topk_limited_nodes: int = None
+    """Number of expert parallel nodes to consider for each token during routing. Perform top-k
+    routing on a subset of expert parallel nodes by first selecting N nodes for each token, then
+    conducting top-k selection among experts on these nodes. None means no node limitation."""
 
     moe_router_pre_softmax: bool = False
     """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. 
