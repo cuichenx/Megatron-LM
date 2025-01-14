@@ -156,6 +156,7 @@ class TopKRouter(Router):
             use_pre_softmax=self.config.moe_router_pre_softmax,
             moe_router_topk_limited_devices=self.config.moe_router_topk_limited_devices,
             moe_router_topk_limited_nodes=self.config.moe_router_topk_limited_nodes,
+            moe_router_topk_num_groups=self.config.moe_router_topk_num_groups,
             moe_router_topk_scaling_factor=self.config.moe_router_topk_scaling_factor,
             deterministic_mode=self.config.deterministic_mode,
         )
@@ -186,6 +187,7 @@ class TopKRouter(Router):
             use_pre_softmax=self.config.moe_router_pre_softmax,
             moe_router_topk_limited_devices=self.config.moe_router_topk_limited_devices,
             moe_router_topk_limited_nodes=self.config.moe_router_topk_limited_nodes,
+            moe_router_topk_num_groups=self.config.moe_router_topk_num_groups,
             moe_router_topk_scaling_factor=self.config.moe_router_topk_scaling_factor,
             deterministic_mode=self.config.deterministic_mode,
         )

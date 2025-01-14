@@ -288,6 +288,9 @@ class TransformerConfig(ModelParallelConfig):
     routing on a subset of expert parallel nodes by first selecting N nodes for each token, then
     conducting top-k selection among experts on these nodes. None means no node limitation."""
 
+    moe_router_topk_num_groups: int = None
+    """Number of groups for routed experts."""
+
     moe_router_pre_softmax: bool = False
     """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. 
     By default, softmax is done after top-k."""
@@ -607,6 +610,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"must be smaller than expert_model_parallel_size "
                     f"{self.expert_model_parallel_size}"
                 )
+
+        if self.moe_router_topk_limited_nodes and not self.moe_router_topk_num_groups:
+            raise ValueError(
+                "When using node-limited routing, moe_router_topk_num_groups must be specified."
+            )
 
         if self.flash_decode and self.fp8:
             raise ValueError("FP8 inference is currently not support with flash decoding.")
