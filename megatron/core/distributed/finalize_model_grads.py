@@ -13,9 +13,9 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from .. import parallel_state
+from ..transformer.moe.moe_utils import update_expert_bias
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
-from ..transformer.moe.moe_utils import update_expert_bias
 
 
 def _unshard_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
