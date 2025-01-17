@@ -160,8 +160,8 @@ class TestAuxLossFreeTop2Router:
             use_cpu_initialization=True,
             expert_model_parallel_size=8,
             moe_router_load_balancing_type="none",  # No aux loss
-            moe_router_score_function="sigmoid",     # Using sigmoid scoring
-            moe_router_enable_expert_bias=True,      # Enable expert bias
+            moe_router_score_function="sigmoid",  # Using sigmoid scoring
+            moe_router_enable_expert_bias=True,  # Enable expert bias
             moe_router_bias_update_rate=0.1,  # Set bias update rate
             moe_router_topk=2,
         )
@@ -190,12 +190,14 @@ class TestAuxLossFreeTop2Router:
             scores1, indices1 = self.router(hidden_states)
             initial_tokens = self.router.local_tokens_per_expert.clone()
             updated_bias = update_expert_bias(
-                self.router.local_tokens_per_expert, self.router.expert_bias, self.router.config.moe_router_bias_update_rate
+                self.router.local_tokens_per_expert,
+                self.router.expert_bias,
+                self.router.config.moe_router_bias_update_rate,
             )
 
         # Verify expert bias was updated
         assert not torch.equal(initial_bias, updated_bias), "Expert bias should be updated"
-        
+
         # Basic output checks
         assert scores1.shape == (64, 8), "Router scores shape mismatch"
         assert indices1.shape == (64, 8), "Router indices shape mismatch"
