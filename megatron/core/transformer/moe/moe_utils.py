@@ -272,11 +272,10 @@ def limited_topk(
     topk: int,
     num_tokens: int,
     num_experts: int,
-    moe_router_topk_limited_devices: int = None,
-    moe_router_topk_limited_nodes: int = None,
-    moe_router_topk_num_groups: int = None,
+    moe_router_group_topk: int,
+    moe_router_num_groups: int,
 ):
-    """Perform top-k routing on a subset of expert parallel devices or nodes.
+    """Perform top-k routing on a subset of expert groups.
 
     Device-limited routing:
         Selects N ranks for each token, then conducts top-k selection among experts on these devices.
@@ -291,33 +290,22 @@ def limited_topk(
         topk (int): The number of experts to select for each token.
         num_tokens (int): The number of tokens.
         num_experts (int): The number of experts.
-        moe_router_topk_limited_devices (int): Number of expert parallel ranks to consider for
-            each token during routing. None indicates no device limitation.
-        moe_router_topk_limited_nodes (int): Number of expert parallel nodes to consider for
-            each token during routing. None indicates no node limitation.
-        moe_router_topk_num_groups (int): Number of groups for routed experts.
+        moe_router_group_topk (int): Number of selected groups for each token.
+        moe_router_num_groups (int): Number of groups for routed experts.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
     """
     # Organize the experts into groups
-    if moe_router_topk_limited_devices:
-        num_groups = (
-            parallel_state.get_expert_model_parallel_world_size()
-        )  # num_group equals to expert parallel size
-        group_scores = scores.view(num_tokens, num_groups, -1).max(dim=-1).values
-        group_idx = torch.topk(group_scores, k=moe_router_topk_limited_devices, dim=-1, sorted=False)[1]
-    elif moe_router_topk_limited_nodes:
-        num_groups = moe_router_topk_num_groups
-        group_scores = scores.view(num_tokens, num_groups, -1).topk(2, dim=-1)[0].sum(dim=-1)
-        group_idx = torch.topk(group_scores, k=moe_router_topk_limited_nodes, dim=-1, sorted=False)[1]
+    group_scores = scores.view(num_tokens, moe_router_num_groups, -1).topk(2, dim=-1)[0].sum(dim=-1)
+    group_idx = torch.topk(group_scores, k=moe_router_group_topk, dim=-1, sorted=False)[1]
     group_mask = torch.zeros_like(group_scores)
     group_mask.scatter_(1, group_idx, 1)
 
     # Mask the experts based on selection groups
     score_mask = (
         group_mask.unsqueeze(-1)
-        .expand(num_tokens, num_groups, num_experts // num_groups)
+        .expand(num_tokens, moe_router_num_groups, num_experts // moe_router_num_groups)
         .reshape(num_tokens, -1)
     )
 
@@ -334,9 +322,8 @@ def topk_softmax_with_capacity(
     pad_to_capacity: bool = False,
     drop_policy: str = "probs",
     use_pre_softmax: bool = False,
-    moe_router_topk_limited_devices: int = None,
-    moe_router_topk_limited_nodes: int = None,
-    moe_router_topk_num_groups: int = None,
+    moe_router_group_topk: int = None,
+    moe_router_num_groups: int = None,
     moe_router_topk_scaling_factor: float = None,
     deterministic_mode: bool = False,
 ):
@@ -351,11 +338,8 @@ def topk_softmax_with_capacity(
                            If "prob", the tokens with the lowest probabilities will be dropped.
                            If "position", tokens at the end of each batch will be dropped.
         use_pre_softmax (bool): Whether to apply softmax before top-k selection.
-        moe_router_topk_limited_devices (int): Number of expert parallel ranks to consider for
-            each token during routing. None indicates no device limitation.
-        moe_router_topk_limited_nodes (int): Number of expert parallel nodes to consider for
-            each token during routing. None indicates no node limitation.
-        moe_router_topk_num_groups (int): Number of groups for routed experts.
+        moe_router_group_topk (int): Number of selected groups for each token.
+        moe_router_num_groups (int): Number of groups for routed experts.
         moe_router_topk_scaling_factor (float): Scaling factor for routing score in top-k
             selection, only works when use_pre_softmax enabled.
         deterministic_mode (bool): Deprecated.
@@ -377,15 +361,14 @@ def topk_softmax_with_capacity(
         # Pre softmax
         scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
 
-        if moe_router_topk_limited_devices or moe_router_topk_limited_nodes:
+        if moe_router_group_topk:
             probs, top_indices = limited_topk(
                 scores,
                 topk,
                 num_tokens,
                 num_experts,
-                moe_router_topk_limited_devices=moe_router_topk_limited_devices,
-                moe_router_topk_limited_nodes=moe_router_topk_limited_nodes,
-                moe_router_topk_num_groups=moe_router_topk_num_groups,
+                moe_router_group_topk,
+                moe_router_num_groups,
             )
         else:
             probs, top_indices = torch.topk(scores, k=topk, dim=1)
@@ -402,15 +385,14 @@ def topk_softmax_with_capacity(
         assert (
             moe_router_topk_scaling_factor is None
         ), "moe_router_topk_scaling_factor is not supported with post-softmax"
-        if moe_router_topk_limited_devices or moe_router_topk_limited_nodes:
+        if moe_router_group_topk:
             scores, top_indices = limited_topk(
                 logits,
                 topk,
                 num_tokens,
                 num_experts,
-                moe_router_topk_limited_devices=moe_router_topk_limited_devices,
-                moe_router_topk_limited_nodes=moe_router_topk_limited_nodes,
-                moe_router_topk_num_groups=moe_router_topk_num_groups,
+                moe_router_group_topk,
+                moe_router_num_groups,
             )
         else:
             scores, top_indices = torch.topk(logits, k=topk, dim=1)

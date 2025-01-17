@@ -154,9 +154,8 @@ class TopKRouter(Router):
             pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             drop_policy=self.config.moe_token_drop_policy,
             use_pre_softmax=self.config.moe_router_pre_softmax,
-            moe_router_topk_limited_devices=self.config.moe_router_topk_limited_devices,
-            moe_router_topk_limited_nodes=self.config.moe_router_topk_limited_nodes,
-            moe_router_topk_num_groups=self.config.moe_router_topk_num_groups,
+            moe_router_group_topk=self.config.moe_router_group_topk,
+            moe_router_num_groups=self.config.moe_router_num_groups,
             moe_router_topk_scaling_factor=self.config.moe_router_topk_scaling_factor,
             deterministic_mode=self.config.deterministic_mode,
         )
@@ -185,9 +184,8 @@ class TopKRouter(Router):
             pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             drop_policy=self.config.moe_token_drop_policy,
             use_pre_softmax=self.config.moe_router_pre_softmax,
-            moe_router_topk_limited_devices=self.config.moe_router_topk_limited_devices,
-            moe_router_topk_limited_nodes=self.config.moe_router_topk_limited_nodes,
-            moe_router_topk_num_groups=self.config.moe_router_topk_num_groups,
+            moe_router_group_topk=self.config.moe_router_group_topk,
+            moe_router_num_groups=self.config.moe_router_num_groups,
             moe_router_topk_scaling_factor=self.config.moe_router_topk_scaling_factor,
             deterministic_mode=self.config.deterministic_mode,
         )

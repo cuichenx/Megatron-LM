@@ -278,18 +278,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
 
-    moe_router_topk_limited_devices: int = None
-    """Number of expert parallel ranks to consider for each token during routing. Perform top-k
-    routing on a subset of expert parallel ranks by first selecting N ranks for each token, then
-    conducting top-k selection among experts on these devices. None means no device limitation."""
+    moe_router_group_topk: int = None
+    """Number of selected groups for each token."""
 
-    moe_router_topk_limited_nodes: int = None
-    """Number of expert parallel nodes to consider for each token during routing. Perform top-k
-    routing on a subset of expert parallel nodes by first selecting N nodes for each token, then
-    conducting top-k selection among experts on these nodes. None means no node limitation."""
-
-    moe_router_topk_num_groups: int = None
-    """Number of groups for routed experts."""
+    moe_router_num_groups: int = None
+    """Number of groups for routed experts.."""
 
     moe_router_pre_softmax: bool = False
     """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. 
@@ -603,17 +596,9 @@ class TransformerConfig(ModelParallelConfig):
                     f"but your version is {get_te_version()}."
                 )
 
-        if self.moe_router_topk_limited_devices:
-            if self.moe_router_topk_limited_devices > self.expert_model_parallel_size:
-                raise ValueError(
-                    f"moe_router_topk_limited_devices: {self.moe_router_topk_limited_devices} "
-                    f"must be smaller than expert_model_parallel_size "
-                    f"{self.expert_model_parallel_size}"
-                )
-
-        if self.moe_router_topk_limited_nodes and not self.moe_router_topk_num_groups:
+        if self.moe_router_group_topk and not self.moe_router_num_groups:
             raise ValueError(
-                "When using node-limited routing, moe_router_topk_num_groups must be specified."
+                "When using limited routing, moe_router_num_groups must be specified."
             )
 
         if self.flash_decode and self.fp8:

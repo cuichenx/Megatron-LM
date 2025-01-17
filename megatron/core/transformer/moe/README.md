@@ -60,9 +60,8 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 | --moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss". |
 | --moe-router-topk | Number of experts to route to for each token. The default is 2. |  
 | --moe-router-pre-softmax | Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k. |
-| --moe-router-topk-limited-devices | Number of expert parallel ranks to consider for each token during routing. Perform top-k routing on a subset of expert parallel ranks by first selecting N ranks for each token, then conducting top-k selection among experts on these devices. Default is None, which means no limited devices. |
-| --moe-router-topk-limited-nodes | Number of expert parallel nodes to consider for each token during routing. Perform top-k routing on a subset of expert parallel nodes by first selecting N nodes for each token, then conducting top-k selection among experts on these nodes. Default is None, which means no limited nodes. |
-| --moe-router-topk-num-groups | Number of groups for routed experts. |
+| --moe-router-group-topk | Number of selected groups for each token. |
+| --moe-router-num-groups | Number of groups for routed experts. |
 | --moe-router-topk-scaling-factor | Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling. |
 | --moe-aux-loss-coeff | Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended. Default is 0.0. |
 | --moe-z-loss-coeff | Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended. Default is None. |
