@@ -239,7 +239,7 @@ class TopKRouter(Router):
         )
         save_to_aux_losses_tracker(
             "load_balancing_loss",
-            aux_loss / moe_aux_loss_coeff if moe_aux_loss_coeff > 0 else 0,
+            aux_loss / moe_aux_loss_coeff if moe_aux_loss_coeff > 0 else torch.zeros(1),
             self.layer_number,
             self.config.num_layers,
             reduce_group=sequence_partition_group,

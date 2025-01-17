@@ -472,7 +472,12 @@ def topk_softmax_with_capacity(
                 )
             else:
                 scores, top_indices = torch.topk(scores_for_routing, k=topk, dim=1)
-        probs = scores / scores.sum(dim=-1, keepdim=True)
+        if topk > 1:
+            probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) 
+        else:
+            probs = scores
+        if moe_router_topk_scaling_factor:
+            probs = probs * moe_router_topk_scaling_factor
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
