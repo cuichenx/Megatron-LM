@@ -19,6 +19,7 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 - Load Balancing algorithms:
     - Sinkhorn (S-BASE)
     - Aux loss / Load balancing loss
+    - Aux-loss-free load balancing strategy
 
 ### Performance Optimizations
 - GroupedGEMM when num local experts > 1
@@ -334,13 +335,13 @@ Here we provide some general rules to get better performance:
     - In practice, EP8TP1 is better than EP4TP2 for 8x7B.
 5. Enable Context Parallelism for long context training.
     - The efficiency of CP largely depends on whether its communication can be overlapped with computation. 
-    - Emperically, use CP when sequence length >= 8K.
+    - Empirically, use CP when sequence length >= 8K.
 
 ### MoE Parallel Folding
 
 MoE Parallel Folding separates the MoE related parallel groups from Dense groups.
 1. Traditional MoE parallel groups are entangled with dense by using a 5-dimension parallel group generator with default order `tp-cp-ep-dp-pp`. The EP group in MoE is a sub-group of DP in Attention.
-2. With MoE Parallel Fodling, we use a parallel group generator with `tp-cp-dp-pp` for Attention, and another with `tp-ep-dp-pp` for MoE. The EPxTP group in MoE is a sub-group of DPxCPxTP in Attention.
+2. With MoE Parallel Folding, we use a parallel group generator with `tp-cp-dp-pp` for Attention, and another with `tp-ep-dp-pp` for MoE. The EPxTP group in MoE is a sub-group of DPxCPxTP in Attention.
 
 By setting `--expert-tensor-parallel-size`, we can set MoE-specific TP size.
 

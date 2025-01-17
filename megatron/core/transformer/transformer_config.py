@@ -294,7 +294,9 @@ class TransformerConfig(ModelParallelConfig):
     """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
 
     moe_router_enable_expert_bias: bool = False
-    """MoE routing with dynamic per-expert bias in aux-loss-free load balancing. See https://arxiv.org/abs/2408.15664"""
+    """MoE routing with dynamic per-expert bias in aux-loss-free load balancing.
+    See https://arxiv.org/abs/2408.15664 for details.
+    """
 
     moe_router_bias_update_rate: float = 3e-4
     """Expert bias update rate."""
@@ -598,9 +600,10 @@ class TransformerConfig(ModelParallelConfig):
                 "alltoall_seq dispatcher not support different TP size for MoE and Dense layer."
             )
 
-        if self.moe_router_enable_expert_bias and self.moe_router_score_function == "softmax":
+        if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
             raise ValueError(
-                "Please add --moe-router-score-function sigmoid to use expert bias for aux-loss-free routing."
+                "Expert bias for aux-loss-free routing only supports sigmoid score function."
+                "Please set --moe-router-score-function sigmoid for sigmoid score function."
             )
 
         if self.num_moe_experts and self.fp8:
