@@ -619,7 +619,7 @@ def update_expert_bias(tokens_per_expert, expert_bias, expert_bias_udpate_rate):
         expert_bias_udpate_rate (float): The update rate for the expert bias.
     """
     with torch.no_grad():
-        # All Reduce Across TPxEPxCPxDP ranks
+        # All Reduce Across TPxCPxDP ranks
         torch.distributed.all_reduce(
             tokens_per_expert,
             group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),

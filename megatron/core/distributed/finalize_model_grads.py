@@ -211,6 +211,10 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
 
 
 def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
+    """
+    Update the expert bias of the router for a global batch.
+    This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
+    """
     if config.moe_router_enable_expert_bias:
         tokens_per_expert_list = []
         expert_bias_list = []
@@ -230,6 +234,7 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
         ):
             tokens_per_expert.zero_()
             expert_bias.copy_(updated_expert_bias)
+
 
 def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torch.Tensor] = None):
     """
