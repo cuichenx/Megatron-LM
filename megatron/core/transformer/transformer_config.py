@@ -298,7 +298,7 @@ class TransformerConfig(ModelParallelConfig):
     See https://arxiv.org/abs/2408.15664 for details.
     """
 
-    moe_router_bias_update_rate: float = 3e-4
+    moe_router_bias_update_rate: float = 1e-3
     """Expert bias update rate."""
 
     moe_grouped_gemm: bool = False

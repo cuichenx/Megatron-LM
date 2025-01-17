@@ -2165,7 +2165,7 @@ def _add_moe_args(parser):
     group.add_argument('--moe-router-topk-scaling-factor', type=float, default=None,
                        help='Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling.')
     group.add_argument('--moe-router-enable-expert-bias', action='store_true', help='TopK routing with dynamic expert bias in the aux-loss-free load balancing strategy.')
-    group.add_argument('--moe-router-bias-update-rate', type=float, default=3e-4, help='Expert bias update rate in the aux-loss-free load balancing strategy.')
+    group.add_argument('--moe-router-bias-update-rate', type=float, default=1e-3, help='Expert bias update rate in the aux-loss-free load balancing strategy.')
     group.add_argument('--moe-use-legacy-grouped-gemm', action='store_true',
                        help='Use legacy GroupedMLP rather than TEGroupedMLP. Note: The legacy one will be deprecated soon.')
     group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
