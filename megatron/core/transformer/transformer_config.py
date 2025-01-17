@@ -599,7 +599,9 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function == "softmax":
-            raise ValueError("Please add --moe-router-score-function sigmoid to use expert bias for aux-loss-free routing.")
+            raise ValueError(
+                "Please add --moe-router-score-function sigmoid to use expert bias for aux-loss-free routing."
+            )
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert

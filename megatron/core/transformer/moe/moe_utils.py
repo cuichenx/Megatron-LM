@@ -452,7 +452,11 @@ def topk_softmax_with_capacity(
             scores_for_routing = scores + expert_bias
             if moe_router_topk_limited_devices:
                 _, top_indices = device_limited_topk(
-                    scores_for_routing, topk, num_tokens, num_experts, moe_router_topk_limited_devices
+                    scores_for_routing,
+                    topk,
+                    num_tokens,
+                    num_experts,
+                    moe_router_topk_limited_devices,
                 )
             else:
                 _, top_indices = torch.topk(scores_for_routing, k=topk, dim=1)
@@ -460,7 +464,11 @@ def topk_softmax_with_capacity(
         else:
             if moe_router_topk_limited_devices:
                 scores, top_indices = device_limited_topk(
-                    scores_for_routing, topk, num_tokens, num_experts, moe_router_topk_limited_devices
+                    scores_for_routing,
+                    topk,
+                    num_tokens,
+                    num_experts,
+                    moe_router_topk_limited_devices,
                 )
             else:
                 scores, top_indices = torch.topk(scores_for_routing, k=topk, dim=1)

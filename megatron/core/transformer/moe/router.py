@@ -108,7 +108,8 @@ class TopKRouter(Router):
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
         if self.enable_expert_bias:
             self.register_buffer(
-                'local_tokens_per_expert', torch.zeros(self.config.num_moe_experts, dtype=torch.float32)
+                'local_tokens_per_expert',
+                torch.zeros(self.config.num_moe_experts, dtype=torch.float32),
             )
             self.register_buffer(
                 'expert_bias', torch.zeros(self.config.num_moe_experts, dtype=torch.float32)
