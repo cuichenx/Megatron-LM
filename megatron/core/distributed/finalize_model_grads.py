@@ -280,7 +280,8 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
 
-    _update_router_expert_bias(model, config)
+    if config.moe_router_enable_expert_bias:
+        _update_router_expert_bias(model, config)
 
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number

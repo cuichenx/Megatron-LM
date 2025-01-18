@@ -227,6 +227,8 @@ class TopKRouter(Router):
     ):
         """Calculate auxiliary loss, attach gradient function to activation and add to logging."""
         moe_aux_loss_coeff = self.config.moe_aux_loss_coeff
+        if moe_aux_loss_coeff == 0:
+            return activation
         sequence_partition_group = None
         if self.config.moe_token_dispatcher_type == "alltoall_seq":
             sequence_partition_group = parallel_state.get_context_parallel_group()
@@ -239,7 +241,7 @@ class TopKRouter(Router):
         )
         save_to_aux_losses_tracker(
             "load_balancing_loss",
-            aux_loss / moe_aux_loss_coeff if moe_aux_loss_coeff > 0 else torch.zeros(1),
+            aux_loss / moe_aux_loss_coeff,
             self.layer_number,
             self.config.num_layers,
             reduce_group=sequence_partition_group,
