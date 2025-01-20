@@ -267,7 +267,7 @@ def sort_chunks_by_idxs(input: torch.Tensor, split_sizes: torch.Tensor, sorted_i
     return output
 
 
-def limited_topk(
+def group_limited_topk(
     scores: torch.Tensor,
     topk: int,
     num_tokens: int,
@@ -297,7 +297,12 @@ def limited_topk(
         Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
     """
     # Organize the experts into groups
-    group_scores = scores.view(num_tokens, moe_router_num_groups, -1).topk(2, dim=-1)[0].sum(dim=-1)
+    if num_experts // moe_router_num_groups > 1:
+        group_scores = (
+            scores.view(num_tokens, moe_router_num_groups, -1).topk(2, dim=-1)[0].sum(dim=-1)
+        )
+    else:
+        group_scores = scores.view(num_tokens, moe_router_num_groups, -1).max(dim=-1).values
     group_idx = torch.topk(group_scores, k=moe_router_group_topk, dim=-1, sorted=False)[1]
     group_mask = torch.zeros_like(group_scores)
     group_mask.scatter_(1, group_idx, 1)
@@ -362,13 +367,8 @@ def topk_softmax_with_capacity(
         scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
 
         if moe_router_group_topk:
-            probs, top_indices = limited_topk(
-                scores,
-                topk,
-                num_tokens,
-                num_experts,
-                moe_router_group_topk,
-                moe_router_num_groups,
+            probs, top_indices = group_limited_topk(
+                scores, topk, num_tokens, num_experts, moe_router_group_topk, moe_router_num_groups
             )
         else:
             probs, top_indices = torch.topk(scores, k=topk, dim=1)
@@ -386,13 +386,8 @@ def topk_softmax_with_capacity(
             moe_router_topk_scaling_factor is None
         ), "moe_router_topk_scaling_factor is not supported with post-softmax"
         if moe_router_group_topk:
-            scores, top_indices = limited_topk(
-                logits,
-                topk,
-                num_tokens,
-                num_experts,
-                moe_router_group_topk,
-                moe_router_num_groups,
+            scores, top_indices = group_limited_topk(
+                logits, topk, num_tokens, num_experts, moe_router_group_topk, moe_router_num_groups
             )
         else:
             scores, top_indices = torch.topk(logits, k=topk, dim=1)

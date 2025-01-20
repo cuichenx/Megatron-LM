@@ -597,9 +597,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_router_group_topk and not self.moe_router_num_groups:
-            raise ValueError(
-                "When using limited routing, moe_router_num_groups must be specified."
-            )
+            raise ValueError("When using limited routing, moe_router_num_groups must be specified.")
 
         if self.flash_decode and self.fp8:
             raise ValueError("FP8 inference is currently not support with flash decoding.")

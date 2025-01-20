@@ -86,7 +86,7 @@ class TestTop2Router:
         assert self.sequential_mlp.router.weight.grad.abs().sum() > 0
 
 
-class TestDeviceLimitedTop2Router:
+class TestGroupLimitedTop2Router:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=8)
         _set_random_seed(seed_=123, data_parallel_random_init=False)
@@ -138,9 +138,3 @@ class TestDeviceLimitedTop2Router:
             print(scores.shape, indices.shape)
             assert scores.shape == (64, 8)
             assert indices.shape == (64, 8)
-            print(
-                (indices == 0).sum(),
-                (indices == 1).sum(),
-                (indices == 2).sum(),
-                (indices == 3).sum(),
-            )
