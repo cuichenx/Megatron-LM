@@ -294,12 +294,15 @@ class TransformerConfig(ModelParallelConfig):
     """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
 
     moe_router_enable_expert_bias: bool = False
-    """MoE routing with dynamic per-expert bias in aux-loss-free load balancing.
-    See https://arxiv.org/abs/2408.15664 for details.
-    """
+    """TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy.
+    The routing decision is based on the sum of the routing scores and the expert bias.
+    See https://arxiv.org/abs/2408.15664 for details."""
 
     moe_router_bias_update_rate: float = 1e-3
-    """Expert bias update rate."""
+    """The expert bias is updated based on the number of assigned tokens to each expert 
+    in a global batch, where the bias is increased for the experts with less assigned tokens
+    and decreased for the experts with more assigned tokens. 
+    The default value 1e-3 is same as that used in DeepSeekV3."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
