@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
-import torch
 import torch.nn.functional as F
 
 from megatron.core.transformer.enums import AttnBackend
