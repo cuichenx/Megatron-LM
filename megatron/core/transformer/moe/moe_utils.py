@@ -297,12 +297,7 @@ def group_limited_topk(
         Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
     """
     # Organize the experts into groups
-    if num_experts // moe_router_num_groups > 1:
-        group_scores = (
-            scores.view(num_tokens, moe_router_num_groups, -1).topk(2, dim=-1)[0].sum(dim=-1)
-        )
-    else:
-        group_scores = scores.view(num_tokens, moe_router_num_groups, -1).max(dim=-1).values
+    group_scores = scores.view(num_tokens, moe_router_num_groups, -1).topk(2, dim=-1)[0].sum(dim=-1)
     group_idx = torch.topk(group_scores, k=moe_router_group_topk, dim=-1, sorted=False)[1]
     group_mask = torch.zeros_like(group_scores)
     group_mask.scatter_(1, group_idx, 1)
@@ -314,7 +309,7 @@ def group_limited_topk(
         .reshape(num_tokens, -1)
     )
 
-    masked_scores = scores.masked_fill(~score_mask.bool(), 0.0)
+    masked_scores = scores.masked_fill(~score_mask.bool(), float('-inf'))
     probs, top_indices = torch.topk(masked_scores, k=topk, dim=-1)
 
     return probs, top_indices
