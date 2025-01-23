@@ -2109,7 +2109,10 @@ def _add_moe_args(parser):
     group.add_argument('--moe-router-pre-softmax', action='store_true',
                        help='Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k.')
     group.add_argument('--moe-router-group-topk', type=int, default=None,
-                       help='Number of selected groups for each token.')
+                       help='Number of expert groups selected for each token during routing. Top-k routing is conducted on a subset of expert groups. '
+                       'Device-limited routing first selects N expert parallel ranks for each token, followed by a top-k selection among experts across these devices. '
+                       'Node-limited routing first selects N expert parallel nodes for each token, and then performs top-k selection among experts across these nodes. '
+                       'Default is None, which indicates no limitations on group selection.')
     group.add_argument('--moe-router-num-groups', type=int, default=None,
                        help='Number of groups for routed experts.')
     group.add_argument('--moe-router-topk-scaling-factor', type=float, default=None,

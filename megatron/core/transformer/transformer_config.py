@@ -278,7 +278,12 @@ class TransformerConfig(ModelParallelConfig):
     """Number of experts to route to for each token."""
 
     moe_router_group_topk: int = None
-    """Number of selected groups for each token."""
+    """Number of expert groups selected for each token during routing. Top-k routing is conducted
+    on a subset of expert groups. Device-limited routing first selects N expert parallel ranks for
+    each token, followed by a top-k selection among experts across these devices. Node-limited
+    routing first selects N expert parallel nodes for each token, and then performs top-k selection
+    among experts across these nodes. Default is None, which indicates no limitations on group
+    selection. """
 
     moe_router_num_groups: int = None
     """Number of groups for routed experts.."""
@@ -595,8 +600,20 @@ class TransformerConfig(ModelParallelConfig):
                     f"but your version is {get_te_version()}."
                 )
 
-        if self.moe_router_group_topk and not self.moe_router_num_groups:
-            raise ValueError("When using limited routing, moe_router_num_groups must be specified.")
+        if self.moe_router_group_topk:
+            if not self.moe_router_num_groups:
+                raise ValueError(
+                    "When using group limited routing, moe_router_num_groups must be specified."
+                )
+            else:
+                assert self.num_moe_expert % self.moe_router_num_groups == 0, (
+                    f"When using group limited routing, num_moe_experts ({self.num_moe_experts}) "
+                    f"should be divisible by moe_router_num_groups ({self.moe_router_num_groups})."
+                )
+                assert self.moe_router_group_topk <= self.moe_router_num_groups, (
+                    f"When using group limited routing, moe_router_group_topk ({self.moe_router_group_topk}) "
+                    f"should be smaller than moe_router_num_groups ({moe_router_num_groups})."
+                )
 
         if self.flash_decode and self.fp8:
             raise ValueError("FP8 inference is currently not support with flash decoding.")

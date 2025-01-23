@@ -277,12 +277,12 @@ def group_limited_topk(
 ):
     """Perform top-k routing on a subset of expert groups.
 
-    Device-limited routing:
-    Selects N ranks for each token, then conducts top-k selection among experts on these devices.
+    Device-limited routing selects N expert parallel ranks for each token,
+    followed by a top-k selection among experts across these devices.
     Refer to DeepSeek-V2 technical report (https://arxiv.org/pdf/2405.04434) for further details.
 
-    Node-limited routing:
-    Selects N nodes for each token, then performs top-k selection among experts on these nodes.
+    Node-limited routing selects N expert parallel nodes for each token,
+    and then conducts top-k selection among experts across these nodes.
     Refer to DeepSeek-V3 technical report (https://arxiv.org/pdf/2412.19437) for further details.
 
     Args:
@@ -290,7 +290,7 @@ def group_limited_topk(
         topk (int): The number of experts to select for each token.
         num_tokens (int): The number of tokens.
         num_experts (int): The number of experts.
-        moe_router_group_topk (int): Number of selected groups for each token.
+        moe_router_group_topk (int): Number of groups selected for each token.
         moe_router_num_groups (int): Number of groups for routed experts.
 
     Returns:
