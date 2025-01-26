@@ -277,16 +277,24 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
 
-    moe_router_group_topk: int = None
-    """Number of expert groups selected for each token during routing. Top-k routing is conducted
-    on a subset of expert groups. Device-limited routing first selects N expert parallel ranks for
-    each token, followed by a top-k selection among experts across these devices. Node-limited
-    routing first selects N expert parallel nodes for each token, and then performs top-k selection
-    among experts across these nodes. Default is None, which indicates no limitations on group
-    selection. """
-
     moe_router_num_groups: int = None
-    """Number of groups for routed experts.."""
+    """Number of groups to divide experts into for group-limited routing.
+    When using group-limited routing:
+    1. Experts are divided into 'moe_router_num_groups' equal-sized groups
+    2. For each token, 'moe_router_group_topk' groups are selected based on routing scores
+       (specifically, the sum of top-2 expert scores within each group)
+    3. From these selected groups, 'moe_router_topk' individual experts are chosen
+    Two common use cases:
+    - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)
+      to limit each token to experts on a subset of devices
+      (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434)
+    - Node-limited routing: Set 'moe_router_num_groups' equal to number of nodes in EP group
+      to limit each token to experts on a subset of nodes
+      (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)
+    """
+
+    moe_router_group_topk: int = None
+    """Number of selected groups for group-limited routing."""
 
     moe_router_pre_softmax: bool = False
     """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. 
@@ -606,13 +614,13 @@ class TransformerConfig(ModelParallelConfig):
                     "When using group limited routing, moe_router_num_groups must be specified."
                 )
             else:
-                assert self.num_moe_expert % self.moe_router_num_groups == 0, (
-                    f"When using group limited routing, num_moe_experts ({self.num_moe_experts}) "
-                    f"should be divisible by moe_router_num_groups ({self.moe_router_num_groups})."
+                assert self.num_moe_experts % self.moe_router_num_groups == 0, (
+                    f"num_moe_experts ({self.num_moe_experts}) should be divisible by "
+                    f"moe_router_num_groups ({self.moe_router_num_groups})."
                 )
                 assert self.moe_router_group_topk <= self.moe_router_num_groups, (
-                    f"When using group limited routing, moe_router_group_topk ({self.moe_router_group_topk}) "
-                    f"should be smaller than moe_router_num_groups ({moe_router_num_groups})."
+                    f"moe_router_group_topk ({self.moe_router_group_topk}) should be smaller than "
+                    f"moe_router_num_groups ({self.moe_router_num_groups})."
                 )
 
         if self.flash_decode and self.fp8:
