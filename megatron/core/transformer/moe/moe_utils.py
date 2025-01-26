@@ -287,7 +287,7 @@ def group_limited_topk(
     - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)
       to limit each token to experts on a subset of devices
       (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434)
-    
+
     - Node-limited routing: Set 'moe_router_num_groups' equal to number of nodes in EP group
       to limit each token to experts on a subset of nodes
       (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)

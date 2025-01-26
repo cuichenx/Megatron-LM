@@ -282,15 +282,15 @@ class TransformerConfig(ModelParallelConfig):
     When using group-limited routing:
     1. Experts are divided into 'moe_router_num_groups' equal-sized groups
     2. For each token, 'moe_router_group_topk' groups are selected based on routing scores
-       (specifically, the sum of top-2 expert scores within each group)
+    (specifically, the sum of top-2 expert scores within each group)
     3. From these selected groups, 'moe_router_topk' individual experts are chosen
     Two common use cases:
     - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)
-      to limit each token to experts on a subset of devices
-      (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434)
+    to limit each token to experts on a subset of devices
+    (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434)
     - Node-limited routing: Set 'moe_router_num_groups' equal to number of nodes in EP group
-      to limit each token to experts on a subset of nodes
-      (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)
+    to limit each token to experts on a subset of nodes
+    (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)
     """
 
     moe_router_group_topk: int = None
