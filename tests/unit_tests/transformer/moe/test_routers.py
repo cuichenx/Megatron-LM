@@ -48,12 +48,13 @@ class TestTop2Router:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.internal
     @pytest.mark.parametrize("moe_router_pre_softmax", [(True), (False)])
-    def test_router_forward(self, moe_router_pre_softmax):
+    @pytest.mark.parametrize("score_function", ["sigmoid", "softmax"])
+    def test_router_forward(self, moe_router_pre_softmax, score_function):
         with torch.no_grad():
             self.router = self.router.cuda()
             self.router.config.moe_router_pre_softmax = moe_router_pre_softmax
+            self.router.config.moe_router_score_function = score_function
             # [num tokens, hidden size]
             hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
             hidden_states = hidden_states.cuda()
@@ -61,7 +62,6 @@ class TestTop2Router:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.internal
     def test_aux_loss(self):
         self.sequential_mlp = self.sequential_mlp.cuda()
 
@@ -125,10 +125,12 @@ class TestDeviceLimitedTop2Router:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("moe_router_pre_softmax", [(True), (False)])
-    def test_router_forward(self, moe_router_pre_softmax):
+    @pytest.mark.parametrize("score_function", ["sigmoid", "softmax"])
+    def test_router_forward(self, moe_router_pre_softmax, score_function):
         with torch.no_grad():
             self.router = self.router.cuda()
             self.router.config.moe_router_pre_softmax = moe_router_pre_softmax
+            self.router.config.moe_router_score_function = score_function
             if moe_router_pre_softmax:
                 self.router.config.moe_router_topk_scaling_factor = 16.0
             # [num tokens, hidden size]

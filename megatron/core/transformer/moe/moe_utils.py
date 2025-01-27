@@ -390,7 +390,7 @@ def topk_softmax_with_capacity(
     Args:
         logits (torch.Tensor): Logits tensor.
         topk (int): The number of experts to select for each token.
-        capacity_factor (int): The capacity factor of each expert. Will drop tokens if the number
+        capacity_factor (float): The capacity factor of each expert. Will drop tokens if the number
                                of tokens exceeds the capacity.
         pad_to_capacity (bool): Whether to need padding in token drop mode.
         drop_policy (str): The policy to drop tokens. Can be either "prob" or "position".
@@ -464,14 +464,10 @@ def topk_softmax_with_capacity(
         else:
             if moe_router_topk_limited_devices:
                 scores, top_indices = device_limited_topk(
-                    scores_for_routing,
-                    topk,
-                    num_tokens,
-                    num_experts,
-                    moe_router_topk_limited_devices,
+                    scores, topk, num_tokens, num_experts, moe_router_topk_limited_devices
                 )
             else:
-                scores, top_indices = torch.topk(scores_for_routing, k=topk, dim=1)
+                scores, top_indices = torch.topk(scores, k=topk, dim=1)
         if topk > 1:
             probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
         else:
