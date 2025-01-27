@@ -110,6 +110,7 @@ class TopKRouter(Router):
             self.register_buffer(
                 'local_tokens_per_expert',
                 torch.zeros(self.config.num_moe_experts, dtype=torch.float32),
+                persistent=False,
             )
             self.register_buffer(
                 'expert_bias', torch.zeros(self.config.num_moe_experts, dtype=torch.float32)
