@@ -417,9 +417,7 @@ def topk_softmax_with_capacity(
 
     def compute_topk(scores, topk, limited_devices=None):
         if limited_devices:
-            return device_limited_topk(
-                scores, topk, num_tokens, num_experts, limited_devices
-            )
+            return device_limited_topk(scores, topk, num_tokens, num_experts, limited_devices)
         else:
             return torch.topk(scores, k=topk, dim=1)
 
@@ -594,7 +592,6 @@ def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_r
             group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
         )
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
-        offset = tokens_per_expert - average_tokens
-        updated_expert_bias = expert_bias - torch.sign(offset) * expert_bias_update_rate
+        offset = average_tokens - tokens_per_expert
+        updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
         return updated_expert_bias
-    
