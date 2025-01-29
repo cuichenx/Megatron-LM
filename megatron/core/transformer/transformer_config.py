@@ -623,6 +623,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"but your version is {get_te_version()}."
                 )
 
+        if self.moe_router_topk == 1 and not self.moe_router_pre_softmax:
+            # Requires applying softmax before selecting the top-k when k is 1,
+            # since softmax on a [num_tokens, 1] would yield a zero gradient.
+            raise ValueError("Please use --moe-router-pre-softmax when topk is 1.")
+
         if self.moe_router_topk_limited_devices:
             if self.moe_router_topk_limited_devices > self.expert_model_parallel_size:
                 raise ValueError(

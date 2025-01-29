@@ -5,7 +5,7 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.moe.moe_utils import update_expert_bias
+from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias
 from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
@@ -191,7 +191,7 @@ class TestAuxLossFreeTop2Router:
             initial_bias = self.router.expert_bias.clone()
             scores1, indices1 = self.router(hidden_states)
             initial_tokens = self.router.local_tokens_per_expert.clone()
-            updated_bias = update_expert_bias(
+            updated_bias = get_updated_expert_bias(
                 self.router.local_tokens_per_expert,
                 self.router.expert_bias,
                 self.router.config.moe_router_bias_update_rate,
