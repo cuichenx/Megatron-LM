@@ -188,7 +188,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         if parallel_state.is_pipeline_last_stage():
             logits = torch.empty(
                 (batch_size, seq_len, self.inference_wrapper_config.padded_vocab_size),
-                dtype=torch.float32,
+                dtype=self.pipeline_communication_dtype,
                 device=torch.cuda.current_device(),
             )
 

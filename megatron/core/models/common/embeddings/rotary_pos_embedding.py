@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -175,7 +175,7 @@ class RotaryEmbedding(nn.Module):
     def get_rotary_seq_len(
         self,
         inference_params: InferenceParams,
-        transformer: TransformerBlock,
+        transformer: Optional[TransformerBlock],
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
         packed_seq_params: PackedSeqParams,
@@ -200,7 +200,7 @@ class RotaryEmbedding(nn.Module):
         elif inference_params is not None:
             rotary_seq_len = inference_params.max_sequence_length
         else:
-            if transformer.input_tensor is not None:
+            if transformer is not None and transformer.input_tensor is not None:
                 rotary_seq_len = transformer.input_tensor.size(0)
             else:
                 rotary_seq_len = transformer_input.size(0)

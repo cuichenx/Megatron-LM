@@ -113,6 +113,16 @@ class FileSystemWriterAsync(FileSystemWriter):
             file_count += 1
             return file_name
 
+        def _copy_to_cpu(ten: torch.Tensor):
+            """Pinned D2H copy (or a simple clone() if already on the CPU)."""
+            if ten.device.type == "cpu":
+                is_view = ten.untyped_storage().size() != ten.numel() * ten.itemsize
+                if is_view:
+                    return ten.detach().clone()
+                else:
+                    return ten.detach()
+            return ten.detach().to("cpu", non_blocking=True)
+
         # Prepare bytes / tensor data in each bucket, which will be assigned to each writer process
         self.write_buckets = []
         for group_name, group_buckets in _split_by_separation_hint(
@@ -125,7 +135,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     if item.type == WriteItemType.BYTE_IO
                 ]
                 tensor_data = [
-                    (item, planner.resolve_data(item).detach().to("cpu", non_blocking=True))
+                    (item, _copy_to_cpu(planner.resolve_data(item)))
                     for item in bucket
                     if item.type != WriteItemType.BYTE_IO
                 ]

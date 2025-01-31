@@ -29,7 +29,7 @@ sys.path.append(
 from megatron.training import get_args
 from megatron.training import get_tokenizer
 from megatron.training.checkpointing import load_checkpoint
-from megatron.core import mpu
+from megatron.core import dist_checkpointing
 from megatron.training.initialize import initialize_megatron
 from megatron.training import get_model
 from typing import List
@@ -97,9 +97,21 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size
     )
 
+def load_nemo_checkpoint(model, load_path):
+    assert len(model) == 1
+    sharded_state_dict = model[0].module.sharded_state_dict(prefix="module.")
+    state_dict = dist_checkpointing.load(sharded_state_dict, load_path)
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k in ['epoch', 'global_step', 'pytorch-lightning_version', 'state_dict', 'loops', 'callbacks',
+                 'optimizer_states', 'lr_schedulers']:
+            continue
+        new_state_dict[k.replace("module.", "")] = v
+    model[0].load_state_dict(new_state_dict)
 
 def main():
     """Main program."""
+    torch.manual_seed(0)
 
     # Note: The default args passed here can be overwritten by using appropriate params (check arguments.py file)
     # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)
@@ -115,7 +127,15 @@ def main():
 
     # Set up model and load checkpoint
     model = get_model(model_provider, wrap_with_ddp=False)
-    load_checkpoint(model, None, None)
+
+    args = get_args()
+
+    # tmp: load nemo weights
+    if args.load and args.load.endswith("weights"):
+        load_nemo_checkpoint(model, args.load)
+    else:
+        load_checkpoint(model, None, None)
+
     model = model[0]
 
     args = get_args()

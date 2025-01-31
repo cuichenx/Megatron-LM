@@ -2,16 +2,18 @@
 
 
 import math
+from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Union
+from typing import Union, Optional, Tuple
 
 import torch
+from torch import Tensor
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, InferenceParams
 from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     _yarn_get_mscale,
-    apply_rotary_pos_emb,
+    apply_rotary_pos_emb, RotaryEmbedding,
 )
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
@@ -63,7 +65,7 @@ class MultiLatentAttention(Attention):
             attention_type=attention_type,
             attn_mask_type=attn_mask_type,
         )
-
+        self.config = config
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
 
         self.q_head_dim = self.config.qk_head_dim + self.config.qk_pos_emb_head_dim
@@ -71,15 +73,26 @@ class MultiLatentAttention(Attention):
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale)
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
 
-        self.rotary_pos_emb = YarnRotaryEmbedding(
-            self.config.qk_pos_emb_head_dim,
-            rotary_base=self.config.rotary_base,
-            scaling_factor=self.config.rotary_scaling_factor,
-            original_max_position_embeddings=self.config.max_position_embeddings,
-            beta_fast=self.config.beta_fast,
-            beta_slow=self.config.beta_slow,
-            mscale=self.config.mscale,
-            mscale_all_dim=self.config.mscale_all_dim,
+        # if config.
+        # self.rotary_pos_emb = YarnRotaryEmbedding(
+        #     self.config.qk_pos_emb_head_dim,
+        #     rotary_base=self.config.rotary_base,
+        #     scaling_factor=self.config.rotary_scaling_factor,
+        #     original_max_position_embeddings=self.config.max_position_embeddings,
+        #     beta_fast=self.config.beta_fast,
+        #     beta_slow=self.config.beta_slow,
+        #     mscale=self.config.mscale,
+        #     mscale_all_dim=self.config.mscale_all_dim,
+        # )
+        # these are hardcoded for deepseek for now
+        self.rotary_pos_emb = RotaryEmbedding(
+            kv_channels=self.config.qk_pos_emb_head_dim,
+            rotary_percent=1.0, #self.config.rotary_percent,
+            rotary_interleaved=self.config.rotary_interleaved,
+            seq_len_interpolation_factor=None, #self.config.seq_len_interpolation_factor,
+            rotary_base=10000, #self.config.rotary_base,
+            rope_scaling=False,
+            use_cpu_initialization=self.config.use_cpu_initialization,
         )
 
         self.core_attention = build_module(
@@ -108,6 +121,19 @@ class MultiLatentAttention(Attention):
             tp_comm_buffer_name='proj',
         )
 
+    @abstractmethod
+    def get_query_key_value_tensors(
+        self,
+        hidden_states,
+        key_value_states=None,
+        packed_seq_params=None,
+        inference_params=None,
+    ):
+        """
+        This method needs to be implemented based on whether the derived class
+        is "self-attn" or "cross-attn".
+        """
+
     def forward(
         self,
         hidden_states,
@@ -119,7 +145,7 @@ class MultiLatentAttention(Attention):
         rotary_pos_sin=None,
         attention_bias=None,
         packed_seq_params=None,
-        position_ids=None,
+        sequence_len_offset=None,
     ):
         """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
@@ -128,6 +154,9 @@ class MultiLatentAttention(Attention):
             rotary_pos_cos is None and rotary_pos_sin is None
         ), "MLA does not support Flash Decoding"
 
+        # self.attn_impl = "naive" if inference_params is None else "absorb"
+        self.attn_impl = "naive"
+
         # hidden_states: [sq, b, h]
 
         # =====================
@@ -135,11 +164,11 @@ class MultiLatentAttention(Attention):
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
-        # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        query, key, value = self.get_query_key_value_tensors(
+        # query: [s, b, 16, 128], key:[s, b, 16, 128], value:[s, b, 16, 128]
+        # kv_compressed: [s, b, 512] , k_pos_emb: [s, b, 64]
+        query, key, value, kv_compressed, k_pos_emb = self.get_query_key_value_tensors(
             hidden_states,
             key_value_states,
-            position_ids,
             packed_seq_params,
             inference_params=inference_params,
         )
@@ -149,7 +178,7 @@ class MultiLatentAttention(Attention):
         # ===================================================
         # rotary_pos_emb = None
         query, key, value, _, attn_mask_type = self._adjust_key_value_for_inference(
-            inference_params, query, key, value, rotary_pos_emb=None
+            inference_params, query, key, value, rotary_pos_emb=None, kv_compressed=kv_compressed, k_pos_emb=k_pos_emb,
         )
 
         # ==================================
@@ -184,12 +213,126 @@ class MultiLatentAttention(Attention):
 
         return output, bias
 
+    def _allocate_memory(self, inference_max_sequence_length, batch_size, dtype, head_dim=None):
+        """Allocate memory to store kv cache (naive) or kv/pe cache (absorb) during MLA inference."""
+        if self.attn_impl == "naive":
+            if head_dim is None:
+                head_dim = self.hidden_size_per_attention_head
+            return torch.empty(
+                inference_max_sequence_length,
+                batch_size,
+                self.num_query_groups_per_partition,
+                head_dim,
+                dtype=dtype,
+                device=torch.cuda.current_device(),
+            )
+        else:
+            assert head_dim is not None
+            return torch.empty(
+                inference_max_sequence_length,
+                batch_size,
+                head_dim,
+                dtype=dtype,
+                device=torch.cuda.current_device(),
+            )
+
+    def _adjust_key_value_for_inference(
+        self,
+        inference_params: InferenceParams,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        rotary_pos_emb: Optional[Tensor],
+        kv_compressed: Tensor = None,
+        k_pos_emb: Tensor = None,
+        rotary_pos_cos: Tensor = None,
+        rotary_pos_sin: Tensor = None,
+        sequence_len_offset=None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], AttnMaskType]:
+        """
+        Saves the generated key and value tensors to the end of the buffers in inference_params.
+        Returns the full size keys and values from the provided inference_params, as well as
+        adjusted rotary_pos_emb.
+
+        Returns a tuple: (key, value, rotary_pos_emb)
+
+        """
+        attn_mask_type = self.attn_mask_type
+        if inference_params is None:
+            return query, key, value, rotary_pos_emb, attn_mask_type
+
+        # =================================================
+        # Pre-allocate memory for key-values for inference.
+        # =================================================
+        if self.layer_number not in inference_params.key_value_memory_dict:
+            inf_max_seq_length = inference_params.max_sequence_length
+            inf_max_batch_size = inference_params.max_batch_size
+            if self.attn_impl == "naive":
+                inference_key_memory = self._allocate_memory(
+                    inf_max_seq_length, inf_max_batch_size, key.dtype, self.q_head_dim,
+                )
+                inference_value_memory = self._allocate_memory(
+                    inf_max_seq_length, inf_max_batch_size, value.dtype, self.config.v_head_dim,
+                )
+            else:
+                # `inference_key_memory` records kv_compressed (c^KV)
+                inference_key_memory = self._allocate_memory(
+                    inf_max_seq_length, inf_max_batch_size, key.dtype, self.q_head_dim,
+                )
+                # `inference_value_memory` records k_pos_emb (k^R)
+                inference_value_memory = self._allocate_memory(
+                    inf_max_seq_length, inf_max_batch_size, value.dtype, self.config.v_head_dim,
+                )
+            inference_params.key_value_memory_dict[self.layer_number] = (
+                inference_key_memory,
+                inference_value_memory,
+            )
+        else:
+            # Get the pre-allocated buffers for this layer
+            inference_key_memory, inference_value_memory = inference_params.key_value_memory_dict[
+                self.layer_number
+            ]
+
+        if inference_params.sequence_len_offset > 0:
+            # This should mean that we are past the prompt forward_step
+            # and so we need to turn off masking
+            attn_mask_type = AttnMaskType.no_mask
+
+        batch_start = inference_params.batch_size_offset
+        batch_end = batch_start + key.size(1)
+        assert batch_end <= inference_key_memory.size(1)
+        sequence_start = inference_params.sequence_len_offset
+        sequence_end = sequence_start + key.size(0)
+        assert sequence_end <= inference_key_memory.size(0)
+
+        if self.config.flash_decode:
+            raise ValueError("MLA does not support Flash Decoding")
+
+        # Copy key and values.
+        inference_key_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = key
+        inference_value_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = value
+        key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
+        value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
+
+        # adjust the key rotary positional embedding
+        if rotary_pos_emb is None:
+            return query, key, value, rotary_pos_emb, attn_mask_type
+
+        q_pos_emb, k_pos_emb = rotary_pos_emb
+        q_pos_emb = q_pos_emb[sequence_start:sequence_end, :, :, :]
+        k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
+        rotary_pos_emb = (q_pos_emb, k_pos_emb)
+
+        return query, key, value, rotary_pos_emb, attn_mask_type
+
 
 class MLASelfAttention(MultiLatentAttention):
     """MLA Self-attention layer class
 
     Self-attention layer takes input with size [s, b, h]
     and returns output of the same size.
+
+    Variables such as c^Q, W^{DQ} refer to naming convention used in DeepSeekV2 paper (in particular, Appendix C).
     """
 
     def __init__(
@@ -209,7 +352,7 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         if self.config.q_lora_rank is None:
-            # Not projectiing query
+            # Not projecting query
             self.linear_q_proj = build_module(
                 submodules.linear_q_proj,
                 self.config.hidden_size,
@@ -223,7 +366,7 @@ class MLASelfAttention(MultiLatentAttention):
             )
 
         else:
-
+            # W^{DQ}
             self.linear_q_down_proj = build_module(
                 submodules.linear_q_down_proj,
                 self.config.hidden_size,
@@ -236,6 +379,7 @@ class MLASelfAttention(MultiLatentAttention):
                 is_expert=False,
             )
 
+            # W^{UQ} and W^{QR} combined
             self.linear_q_up_proj = build_module(
                 submodules.linear_q_up_proj,
                 self.config.q_lora_rank,
@@ -248,6 +392,7 @@ class MLASelfAttention(MultiLatentAttention):
                 is_expert=False,
             )
 
+        # W^{DKV}, W^{KR} combined
         self.linear_kv_down_proj = build_module(
             submodules.linear_kv_down_proj,
             self.config.hidden_size,
@@ -260,6 +405,7 @@ class MLASelfAttention(MultiLatentAttention):
             is_expert=False,
         )
 
+        # W^{UK}, W^{UV} combined
         self.linear_kv_up_proj = build_module(
             submodules.linear_kv_up_proj,
             self.config.kv_lora_rank,
@@ -291,7 +437,6 @@ class MLASelfAttention(MultiLatentAttention):
         self,
         hidden_states,
         key_value_states=None,
-        position_ids=None,
         packed_seq_params=None,
         inference_params=None,
     ):
@@ -306,6 +451,7 @@ class MLASelfAttention(MultiLatentAttention):
         q_len, bsz, _ = hidden_states.size()
 
         if self.config.q_lora_rank is not None:
+            # q_compressed is c^Q
             q_compressed, _ = self.linear_q_down_proj(hidden_states)
             q_compressed = self.q_layernorm(q_compressed)
             q, _ = self.linear_q_up_proj(q_compressed)
@@ -316,7 +462,7 @@ class MLASelfAttention(MultiLatentAttention):
         # q: [s, b, n, 192]
         q = q.view(q_len, bsz, self.num_attention_heads_per_partition, self.q_head_dim)
 
-        # q: [s, b, n, 128], q_pos_emb: [s, b, n, 64]
+        # q_no_pe (q^C): [s, b, n, 128], q_pos_emb (W^{QR}c^Q): [s, b, n, 64]
         q_no_pe, q_pos_emb = torch.split(
             q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
         )
@@ -324,13 +470,14 @@ class MLASelfAttention(MultiLatentAttention):
         # kv_combined: [s, b, 576]
         kv_combined, _ = self.linear_kv_down_proj(hidden_states)
 
-        # kv_compressed:[s, b, 512], k_pos_emb: [s, b, 64]
+        # kv_compressed (c^{KV}):[s, b, 512], k_pos_emb (W^{KR}h): [s, b, 64]
         kv_compressed, k_pos_emb = torch.split(
             kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
         )
+        kv_compressed = self.kv_layernorm(kv_compressed)  # cached in the "absorbed" implementation
 
         # kv: [s, b, 2048]
-        kv, _ = self.linear_kv_up_proj(self.kv_layernorm(kv_compressed))
+        kv, _ = self.linear_kv_up_proj(kv_compressed)
 
         # kv: [s, b, n, 256]
         kv = kv.view(
@@ -340,15 +487,25 @@ class MLASelfAttention(MultiLatentAttention):
             self.config.qk_head_dim + self.config.v_head_dim,
         )
 
-        # k_no_pe: [s, b, n, 128], value: [s, b, n, 128]
+        # k_no_pe (k^C): [s, b, n, 128], value (v^C): [s, b, n, 128]
         k_no_pe, value = torch.split(kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1)
 
         # rotary_pos_emb:[s, b, 1, 64]
-        rotary_pos_emb = self.rotary_pos_emb(max_seq_len=self.config.max_position_embeddings)
+        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                    inference_params, None, hidden_states, self.config, packed_seq_params
+                )
 
-        if len(rotary_pos_emb) == 2:
+        if True: #self.config.rope_type == "rope":
+            rope_kwargs = {"packed_seq": packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'}
+        else:
+            rope_kwargs = {}
+        rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, **rope_kwargs)
+
+        if isinstance(rotary_pos_emb, tuple) and len(rotary_pos_emb) == 2:
             mscale = rotary_pos_emb[1]
             rotary_pos_emb = rotary_pos_emb[0]
+        else:
+            mscale = 1.0
 
         if inference_params is not None:
             # add offset to the sequence start for inference
@@ -365,7 +522,7 @@ class MLASelfAttention(MultiLatentAttention):
         else:
             cu_seqlens_q = cu_seqlens_kv = None
 
-        # q_pos_emb: [s, b, n, 64], k_pos_emb:[s, b, 1, 64]
+        # q_pos_emb (q^R): [s, b, n, 64], k_pos_emb (k^R):[s, b, 1, 64]
         q_pos_emb = apply_rotary_pos_emb(
             q_pos_emb, rotary_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q, mscale=mscale
         )
@@ -373,15 +530,15 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb, rotary_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv, mscale=mscale
         )
 
-        # query: [s, b, n, 192]
+        # query (q): [s, b, n, 192]
         query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
 
-        # key: [s, b, n, 192]
-        k_pos_emb = k_pos_emb.expand(-1, -1, self.config.num_attention_heads, -1)
-        key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+        # key (k): [s, b, n, 192]
+        k_pos_emb_expanded = k_pos_emb.expand(-1, -1, self.config.num_attention_heads, -1)
+        key = torch.cat([k_no_pe, k_pos_emb_expanded], dim=-1)
 
         query = query.contiguous()
         key = key.contiguous()
         value = value.contiguous()
 
-        return query, key, value
+        return query, key, value, kv_compressed, k_pos_emb.squeeze(2)

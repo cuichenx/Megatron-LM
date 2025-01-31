@@ -708,8 +708,8 @@ class MLATransformerConfig(TransformerConfig):
     beta_slow: float = 1
     """Beta slow for YaRN RoPE."""
 
-    mscale: float = 0.707
+    mscale: float = 1.0
     """Mscale for YaRN RoPE in Multi-Latent Attention."""
 
-    mscale_all_dim: float = 0.707
+    mscale_all_dim: float = 1.0
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention."""
