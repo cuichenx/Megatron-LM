@@ -36,6 +36,8 @@ functional:configure:
       A100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_A100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
       H100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_H100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
     - |
+      RECORD_CHECKPOINTS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Record checkpoints"* ]] && echo "true" || echo "false")
+    - |
       if [[ "$FUNCTIONAL_TEST_SCOPE" == "release" || "$FUNCTIONAL_TEST_SCOPE" == "pre-release" ]]; then
         FUNCTIONAL_TEST_NAME=$(eval echo $FUNCTIONAL_TEST_NAME)
         RELEASE_ARGS=(
@@ -58,6 +60,7 @@ functional:configure:
         "--container-image ${UTILITY_IMAGE}"
         "--container-tag ${CI_PIPELINE_ID}"
         "--dependent-job functional:configure"
+        "--record-checkpoints ${RECORD_CHECKPOINTS}"
       )
     - |
       export PYTHONPATH=$(pwd)
@@ -117,9 +120,9 @@ functional:run_nemo:
     variables: true
   variables:
     MCORE_COMMIT: $CI_COMMIT_SHA
-    TEST_LLM_MODULE: true
-    TEST_ALIGNER_MODULE: false
-    TEST_DATA_CURATOR_MODULE: false
+    TEST_LLM_MODULE: 'True'
+    TEST_ALIGNER_MODULE: 'False'
+    TEST_DATA_CURATOR_MODULE: 'False'
     TESTS_TO_RUN_ON_THIS_COMMIT: nightly
   rules:
     - if: $FUNCTIONAL_TEST == "yes"
