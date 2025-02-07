@@ -92,6 +92,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     )
 
     if multi_latent_attention:
+        # noinspection PyTypeChecker
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -131,7 +132,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         # for QKLayerNorm if TE Version < 1.9;
         # we instead use the Apex implementation.
         qk_norm = TENorm if is_te_min_version("1.9.0") else FusedLayerNorm
-
+        # noinspection PyTypeChecker
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -190,6 +191,7 @@ def get_gpt_layer_local_spec(
     )
 
     if multi_latent_attention:
+        # noinspection PyTypeChecker
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -216,6 +218,7 @@ def get_gpt_layer_local_spec(
             ),
         )
     else:
+        # noinspection PyTypeChecker
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -280,6 +283,7 @@ def get_mlp_module_spec(
 
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
+        # noinspection PyTypeChecker
         return ModuleSpec(
             module=MLP,
             submodules=MLPSubmodules(

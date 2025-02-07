@@ -256,6 +256,13 @@ class TELinear(te.pytorch.Linear):
             return out
         return out, None
 
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Replicate cross TP/DP."""
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, None, sharded_offsets
+        )
+
 
 class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     """
