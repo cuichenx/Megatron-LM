@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -284,6 +285,11 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
+
+    moe_router_topk_limited_devices: int = None
+    """Number of EP ranks to consider for each token in group-limited routing, 
+    DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
+    """
 
     moe_router_num_groups: int = None
     """Number of groups to divide experts into for group-limited routing.
@@ -602,7 +608,7 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.num_layers_in_last_pipeline_stage is not None:
                 if self.num_layers_in_last_pipeline_stage <= 0:
-                    raise ValueError('num_layers_in_first_pipeline_stage must be larger than 0')
+                    raise ValueError('num_layers_in_last_pipeline_stage must be larger than 0')
 
                 if self.virtual_pipeline_model_parallel_size is not None:
                     if (
@@ -770,6 +776,11 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError("Please use --moe-router-pre-softmax when topk is 1.")
 
         if self.moe_router_group_topk:
+            if self.moe_router_topk_limited_devices:
+                raise ValueError(
+                    "moe_router_topk_limited_devices is deprecated and replaced by "
+                    "moe_router_group_topk and moe_router_num_groups."
+                )
             if not self.moe_router_num_groups:
                 raise ValueError(
                     "When using group limited routing, moe_router_num_groups must be specified."
@@ -783,6 +794,13 @@ class TransformerConfig(ModelParallelConfig):
                     f"moe_router_group_topk ({self.moe_router_group_topk}) should be smaller than "
                     f"moe_router_num_groups ({self.moe_router_num_groups})."
                 )
+        elif self.moe_router_topk_limited_devices:
+            warnings.warn(
+                "moe_router_topk_limited_devices is deprecated. Use moe_router_group_topk and "
+                "moe_router_num_groups instead."
+            )
+            self.moe_router_group_topk = self.moe_router_topk_limited_devices
+            self.moe_router_num_groups = self.expert_model_parallel_size
 
         if self.flash_decode and self.fp8:
             raise ValueError("FP8 inference is currently not support with flash decoding.")
