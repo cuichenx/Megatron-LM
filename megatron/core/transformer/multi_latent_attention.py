@@ -353,8 +353,11 @@ class MLASelfAttention(MultiLatentAttention):
         # k_no_pe: [s, b, n, 128], value: [s, b, n, 128]
         k_no_pe, value = torch.split(kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1)
 
+        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+            inference_params, None, hidden_states, self.config, packed_seq_params
+        )
         # rotary_pos_emb:[s, b, 1, 64]
-        rotary_pos_emb = self.rotary_pos_emb(max_seq_len=self.config.max_position_embeddings)
+        rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len)
 
         if len(rotary_pos_emb) == 2:
             mscale = rotary_pos_emb[1]
