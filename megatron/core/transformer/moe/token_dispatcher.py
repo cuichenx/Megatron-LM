@@ -215,9 +215,11 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         permuted_probs = self.local_probs.T.contiguous().masked_select(
             self.local_map.T.contiguous()
         )
-        hidden_states = hidden_states * permuted_probs.unsqueeze(-1)
+        if self.config.moe_router_use_fp32:
+            assert permuted_probs.dtype == torch.float32, "Expected float32 for probs"
+        weighted_hidden_states = hidden_states * permuted_probs.unsqueeze(-1)
         unpermuted_local_hidden = unpermute(
-            hidden_states,
+            weighted_hidden_states,
             self.reversed_local_input_permutation_mapping,
             restore_shape=self.hidden_shape_before_permute,
         )
@@ -225,9 +227,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         unpermuted_local_bias = None
         if self.add_bias:
             assert bias is not None
-            bias = bias * permuted_probs.unsqueeze(-1)
+            weighted_bias = bias * permuted_probs.unsqueeze(-1)
             unpermuted_local_bias = unpermute(
-                bias,
+                weighted_bias,
                 self.reversed_local_input_permutation_mapping,
                 restore_shape=self.hidden_shape_before_permute,
             )
@@ -254,6 +256,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         if self.add_bias:
             output_bias_total = output_bias_total.view(self.hidden_shape)
 
+        output_total = output_total.to(hidden_states.dtype)
+        if bias is not None:
+            output_bias_total = output_bias_total.to(bias.dtype)
         return output_total, output_bias_total
 
 

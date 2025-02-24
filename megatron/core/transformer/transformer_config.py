@@ -321,6 +321,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_score_function: str = "softmax"
     """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
 
+    moe_router_use_fp32: bool = False
+    """Use fp32 for routing and expert output weighted averaging. Using fp32 can improve stability
+    especially when the number of experts is large (e.g. finegrained-moe)."""
+
     moe_router_enable_expert_bias: bool = False
     """TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy.
     The routing decision is based on the sum of the routing scores and the expert bias.
@@ -836,6 +840,16 @@ class TransformerConfig(ModelParallelConfig):
             self.pipeline_model_parallel_size > 0
         ), f"Pipeline model parallel size must be larger than 0 \
             when enable --standalone-embedding-stage and --standalone-loss-stage"
+
+        if (
+            self.num_moe_experts is not None
+            and self.num_moe_experts >= 32
+            and not self.moe_router_use_fp32
+        ):
+            warnings.warn(
+                "Using a large number of experts (>=32) without fp32 routing. "
+                "Consider enabling moe_router_use_fp32 for better numerical stability."
+            )
 
 
 @dataclass

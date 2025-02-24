@@ -59,7 +59,9 @@ class Router(ABC, MegatronModule):
         if self.weight.device.type == 'cpu':
             # move weights to GPU
             self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
-        logits = torch.nn.functional.linear(input, self.weight)
+        # Convert to fp32 for routing computation if enabled
+        router_dtype = torch.float32 if self.config.moe_router_use_fp32 else input.dtype
+        logits = torch.nn.functional.linear(input.to(router_dtype), self.weight.to(router_dtype))
         return logits
 
     @abstractmethod

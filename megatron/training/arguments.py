@@ -2189,6 +2189,10 @@ def _add_moe_args(parser):
                        choices=['aux_loss', 'seq_aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
+    group.add_argument('--moe-router-use-fp32', action='store_true',
+                       help='Use FP32 precision for routing computation and expert output weighted averaging. '
+                            'This can improve numerical stability, particularly when using a large number of experts (>=32). '
+                            'The throughput impact should be negligible when used with permute fusion.')
     group.add_argument('--moe-router-score-function', type=str,
                        choices=['softmax', 'sigmoid'],
                        default='softmax',
