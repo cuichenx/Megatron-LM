@@ -1,6 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+import importlib.util
+import os
+from functools import lru_cache
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -14,6 +17,33 @@ from megatron.core.utils import nvtx_decorator
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointManager
+
+
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+@lru_cache(maxsize=1)
+def _get_official_hc_split_sinkhorn():
+    kernel_path = os.environ.get("DSV4_TILELANG_KERNEL_PATH")
+    if kernel_path:
+        if os.path.isdir(kernel_path):
+            kernel_path = os.path.join(kernel_path, "kernel.py")
+        spec = importlib.util.spec_from_file_location("dsv4_official_tilelang_kernel", kernel_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load DSv4 TileLang kernel from {kernel_path!r}.")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.hc_split_sinkhorn
+
+    try:
+        from kernel import hc_split_sinkhorn
+    except Exception as exc:
+        raise RuntimeError(
+            "DSV4_OFFICIAL_MHC=1 requires DeepSeek-V4 official inference/kernel.py. "
+            "Set DSV4_TILELANG_KERNEL_PATH to the file or containing directory."
+        ) from exc
+    return hc_split_sinkhorn
 
 
 @torch.compile
@@ -211,6 +241,27 @@ class HyperConnectionModule(MegatronModule):
         proj, r = self._proj_rms_op(x_2d, self.mapping_proj.weight, self.norm_eps)
         return proj.view(s, b, -1), r.view(s, b, 1)
 
+    def _compute_official_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        """Compute mHC mappings with the official DeepSeek-V4 inference helper."""
+        s, b, _ = x.shape
+        x_float = x.float()
+        rsqrt = torch.rsqrt(x_float.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(x_float, self.mapping_proj.weight.float()) * rsqrt
+        hc_scale = torch.cat([self.alpha_pre, self.alpha_post, self.alpha_res]).float()
+        hc_split_sinkhorn = _get_official_hc_split_sinkhorn()
+        h_pre, h_post, h_res = hc_split_sinkhorn(
+            mixes.permute(1, 0, 2).contiguous(),
+            hc_scale.contiguous(),
+            self.bias.float().contiguous(),
+            self.n,
+            self.sinkhorn_iterations,
+            self.norm_eps,
+        )
+        h_pre = h_pre.permute(1, 0, 2).contiguous()
+        h_post = h_post.permute(1, 0, 2).contiguous()
+        h_res = h_res.permute(1, 0, 2, 3).transpose(-1, -2).contiguous()
+        return h_pre, h_post, h_res
+
     @torch.compile
     def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
@@ -257,6 +308,9 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights (2*sigmoid activated)
             h_res: [s, b, n, n] - residual mixing matrix (doubly stochastic)
         """
+        if _env_enabled("DSV4_OFFICIAL_MHC"):
+            return self._compute_official_mappings(x)
+
         s, b, _ = x.shape
         with torch.cuda.nvtx.range("HyperConnection::projection_and_get_norm"):
             proj, r = self._projection_and_get_norm(x)

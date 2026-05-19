@@ -310,6 +310,12 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
     disabled."""
 
+    csa_backend: Literal["unfused", "cudnn_dsa", "tilelang_official", "flashmla_official"] = (
+        "unfused"
+    )
+    """Backend for compressed sparse attention. ``cudnn_dsa`` uses the cuDNN frontend DSA
+    sparse-attention backward kernel with the reference forward path."""
+
     ####################
     # linear attention
     ####################
@@ -1319,6 +1325,12 @@ class TransformerConfig(ModelParallelConfig):
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
+            assert self.csa_backend in [
+                "unfused",
+                "cudnn_dsa",
+                "tilelang_official",
+                "flashmla_official",
+            ], "csa_backend must be 'unfused', 'cudnn_dsa', 'tilelang_official', or 'flashmla_official'."
             self.hetereogenous_dist_checkpoint = True
 
         if self.fp8:

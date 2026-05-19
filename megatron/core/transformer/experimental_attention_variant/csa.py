@@ -1,6 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+import importlib.util
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple, Union
@@ -28,6 +30,10 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
 # ---------------------------------------------------------------------------
+
+
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
 
 
 # TODO: the lru_cache may not work well with packed sequence
@@ -175,7 +181,8 @@ def unfused_compressed_sparse_attn(
     attn_sink: torch.Tensor,
     topk_indices: torch.Tensor,
     softmax_scale: float,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Differentiable sparse attention with MQA and attention sink.
 
     Args:
@@ -184,9 +191,11 @@ def unfused_compressed_sparse_attn(
         attn_sink:    [np]              per-head learnable bias.
         topk_indices: [b, sq, topk]     indices into kv_full (int32, -1 = invalid).
         softmax_scale: float
+        return_lse:    return KV-only logsumexp for DSA backward.
 
     Returns:
         output:       [sq, b, np * hn]
+        lse:          [b, sq, np] if return_lse=True, excluding attention sink.
     """
     sq, b, np_, hn = query.size()
 
@@ -212,6 +221,7 @@ def unfused_compressed_sparse_attn(
     # Mask invalid
     invalid_mask = (topk_indices < 0).unsqueeze(1)  # [b, 1, sq, topk]
     scores = scores.masked_fill(invalid_mask, float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1)  # [b, np, sq], excludes attention sink
 
     # --- Softmax with attention sink ---
     sink = attn_sink.view(1, np_, 1, 1).float()
@@ -231,7 +241,208 @@ def unfused_compressed_sparse_attn(
     # [b, np, sq, hn] -> [sq, b, np, hn] -> [sq, b, np * hn]
     output = output.permute(2, 0, 1, 3).contiguous()
     output = output.reshape(sq, b, np_ * hn)
+    if return_lse:
+        lse = lse.permute(0, 2, 1).contiguous()
+        return output, lse
     return output
+
+
+def _get_cudnn_dsa():
+    try:
+        from cudnn import DSA
+    except Exception as exc:
+        raise RuntimeError(
+            "csa_backend='cudnn_dsa' requires cudnn_frontend with the DSA CuTe DSL "
+            "extensions installed."
+        ) from exc
+    return DSA
+
+
+@lru_cache(maxsize=1)
+def _get_tilelang_kernel_module():
+    kernel_path = os.environ.get("DSV4_TILELANG_KERNEL_PATH")
+    if kernel_path:
+        if os.path.isdir(kernel_path):
+            kernel_path = os.path.join(kernel_path, "kernel.py")
+        spec = importlib.util.spec_from_file_location("dsv4_official_tilelang_kernel", kernel_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load DSv4 TileLang kernel from {kernel_path!r}.")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    try:
+        import kernel
+    except Exception as exc:
+        raise RuntimeError(
+            "Official DeepSeek-V4 TileLang helpers require inference/kernel.py. "
+            "Set DSV4_TILELANG_KERNEL_PATH to the file or containing directory."
+        ) from exc
+    return kernel
+
+
+def _get_tilelang_sparse_attn():
+    return _get_tilelang_kernel_module().sparse_attn
+
+
+@lru_cache(maxsize=1)
+def _get_flash_mla_sparse_fwd():
+    try:
+        from flash_mla import flash_mla_sparse_fwd
+    except Exception as exc:
+        raise RuntimeError(
+            "csa_backend='flashmla_official' requires DeepSeek FlashMLA on PYTHONPATH."
+        ) from exc
+    return flash_mla_sparse_fwd
+
+
+def _official_act_quant_inplace(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    kernel = _get_tilelang_kernel_module()
+    return kernel.act_quant(
+        x,
+        block_size=block_size,
+        scale_fmt=None,
+        scale_dtype=torch.float32,
+        inplace=True,
+    )
+
+
+def _official_fp4_act_quant_inplace(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    return _get_tilelang_kernel_module().fp4_act_quant(x, block_size=block_size, inplace=True)
+
+
+def tilelang_compressed_sparse_attn(
+    query: torch.Tensor,
+    kv_full: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Run the official DeepSeek-V4 TileLang sparse attention kernel."""
+    sq, b, np_, hn = query.size()
+    q = query.permute(1, 0, 2, 3).contiguous()
+    kv = kv_full.permute(1, 0, 2).contiguous()
+    sparse_attn = _get_tilelang_sparse_attn()
+    topk = topk_indices.int().contiguous()
+    sink = attn_sink.float().contiguous()
+    outputs = []
+    for start in range(0, np_, 16):
+        end = min(start + 16, np_)
+        outputs.append(
+            sparse_attn(
+                q[:, :, start:end, :].contiguous(),
+                kv,
+                sink[start:end].contiguous(),
+                topk,
+                float(softmax_scale),
+            )
+        )
+    output = torch.cat(outputs, dim=2)
+    return output.permute(1, 0, 2, 3).contiguous().view(sq, b, np_ * hn)
+
+
+def flashmla_compressed_sparse_attn(
+    query: torch.Tensor,
+    kv_full: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Run DeepSeek FlashMLA sparse prefill for the CSA forward path."""
+    sq, b, np_, hn = query.size()
+    if hn != 512:
+        raise RuntimeError(f"FlashMLA sparse prefill requires head_dim=512, got {hn}.")
+    if np_ not in (64, 128):
+        raise RuntimeError(f"FlashMLA sparse prefill requires 64 or 128 query heads, got {np_}.")
+
+    flash_mla_sparse_fwd = _get_flash_mla_sparse_fwd()
+    sink = attn_sink.float().contiguous()
+    topk_block = 64 if np_ == 64 else 128
+    original_topk = int(topk_indices.size(-1))
+    padded_topk = ((original_topk + topk_block - 1) // topk_block) * topk_block
+    topk_pad = padded_topk - original_topk
+    outputs = []
+    for batch_idx in range(b):
+        q = query[:, batch_idx, :, :].contiguous()
+        kv = kv_full[:, batch_idx, :].unsqueeze(1).contiguous()
+        indices = topk_indices[batch_idx].unsqueeze(1).int().contiguous()
+        topk_length = None
+        if topk_pad:
+            pad = torch.full((sq, 1, topk_pad), -1, dtype=indices.dtype, device=indices.device)
+            indices = torch.cat([indices, pad], dim=-1).contiguous()
+            topk_length = torch.full((sq,), original_topk, dtype=torch.int32, device=indices.device)
+        out, _max_logits, _lse = flash_mla_sparse_fwd(
+            q,
+            kv,
+            indices,
+            float(softmax_scale),
+            d_v=hn,
+            attn_sink=sink,
+            topk_length=topk_length,
+        )
+        outputs.append(out)
+    return torch.stack(outputs, dim=1).contiguous().view(sq, b, np_ * hn)
+
+
+def _globalize_topk_idxs(topk_idxs: torch.Tensor, n_kv: int) -> torch.Tensor:
+    """Convert per-batch KV indices to flat global indices."""
+    b, sq, _ = topk_idxs.shape
+    batch_offsets = torch.arange(b, device=topk_idxs.device, dtype=topk_idxs.dtype)
+    batch_offsets = batch_offsets.view(b, 1, 1) * n_kv
+    return torch.where(topk_idxs >= 0, topk_idxs + batch_offsets, topk_idxs).reshape(b * sq, -1)
+
+
+class _CudnnDSASparseAttention(torch.autograd.Function):
+    """Use cuDNN frontend DSA sparse-attention backward with the reference forward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        query: torch.Tensor,
+        kv_full: torch.Tensor,
+        attn_sink: torch.Tensor,
+        topk_idxs: torch.Tensor,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        _get_cudnn_dsa()
+        topk_idxs = topk_idxs.contiguous()
+        output, lse = unfused_compressed_sparse_attn(
+            query, kv_full, attn_sink, topk_idxs, softmax_scale, return_lse=True
+        )
+        ctx.save_for_backward(query, kv_full, attn_sink, topk_idxs, output, lse)
+        ctx.softmax_scale = float(softmax_scale)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        DSA = _get_cudnn_dsa()
+        query, kv_full, attn_sink, topk_idxs, output, lse = ctx.saved_tensors
+        sq, b, np_, hn = query.shape
+        n_kv = kv_full.shape[0]
+
+        q_flat = query.permute(1, 0, 2, 3).contiguous().reshape(b * sq, np_, hn)
+        kv_flat = kv_full.permute(1, 0, 2).contiguous().reshape(b * n_kv, hn)
+        out_flat = output.reshape(sq, b, np_, hn).permute(1, 0, 2, 3).contiguous()
+        out_flat = out_flat.reshape(b * sq, np_, hn)
+        dout_flat = grad_output.reshape(sq, b, np_, hn).permute(1, 0, 2, 3).contiguous()
+        dout_flat = dout_flat.reshape(b * sq, np_, hn)
+        lse_flat = lse.reshape(b * sq, np_).contiguous()
+        topk_global = _globalize_topk_idxs(topk_idxs, n_kv).int().contiguous()
+
+        result = DSA.sparse_attention_backward_wrapper(
+            q_flat,
+            kv_flat,
+            out_flat,
+            dout_flat,
+            lse_flat,
+            attn_sink.float().contiguous(),
+            topk_global,
+            softmax_scale=ctx.softmax_scale,
+        )
+        dq = result["dq"].reshape(b, sq, np_, hn).permute(1, 0, 2, 3).contiguous()
+        dkv = result["dkv"].reshape(b, n_kv, hn).permute(1, 0, 2).contiguous()
+        d_sink = result["d_sink"].to(attn_sink.dtype)
+        return dq, dkv, d_sink, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +602,10 @@ class Compressor(MegatronModule):
 
         if self.rotate:
             kv = rotate_activation(kv)
+            if _env_enabled("DSV4_OFFICIAL_QUANT_SIM"):
+                _official_fp4_act_quant_inplace(kv, block_size=32)
+        elif _env_enabled("DSV4_OFFICIAL_QUANT_SIM"):
+            _official_act_quant_inplace(kv[..., : -self.qk_pos_emb_head_dim], block_size=64)
 
         nvtx_range_pop("compressor")
         return kv  # [n_compressed, b, head_dim]
@@ -506,12 +721,17 @@ class CSAIndexer(MegatronModule):
             cp_group=self.pg_collection.cp,
         )
         q = rotate_activation(q)
+        if _env_enabled("DSV4_OFFICIAL_QUANT_SIM"):
+            _official_fp4_act_quant_inplace(q, block_size=32)
 
         # K path: own compressor
         k = self.compressor(x)  # [sq//ratio, b, index_head_dim]
 
         weights, _ = self.linear_weights_proj(x)  # [sq, b, n_heads]
-        weights = weights * (self.index_n_heads**-0.5)
+        weight_scale = self.index_n_heads**-0.5
+        if _env_enabled("DSV4_OFFICIAL_QUANT_SIM"):
+            weight_scale *= self.softmax_scale
+        weights = weights * weight_scale
 
         nvtx_range_pop("indexer_before_topk")
         return q, k, weights
@@ -596,7 +816,14 @@ class CompressedSparseAttention(MegatronModule):
             softmax_scale = config.v_head_dim**-0.5
         self.softmax_scale = softmax_scale
 
-        self.force_unfused_dsa = getattr(config, 'force_unfused_dsa', True)
+        self.csa_backend = getattr(config, 'csa_backend', 'unfused')
+        if self.csa_backend not in (
+            'unfused',
+            'cudnn_dsa',
+            'tilelang_official',
+            'flashmla_official',
+        ):
+            raise ValueError(f"Unsupported csa_backend: {self.csa_backend}")
 
         # Learnable attention sink per head
         self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
@@ -687,88 +914,96 @@ class CompressedSparseAttention(MegatronModule):
         # --- Step 4: Compressed indices ---
         indexer_loss = None
 
-        if self.force_unfused_dsa:
-            if self.compress_ratio > 1 and n_compressed > 0:
-                nvtx_range_push("compressed_indices")
-                if self.indexer is not None:
-                    x_det = x.detach()
-                    qr_det = qr.detach()
+        if self.compress_ratio > 1 and n_compressed > 0:
+            nvtx_range_push("compressed_indices")
+            if self.indexer is not None:
+                x_det = x.detach()
+                qr_det = qr.detach()
 
-                    causal_mask = (
-                        torch.arange(n_compressed, device=x.device).unsqueeze(0).expand(sq, -1)
+                causal_mask = torch.arange(n_compressed, device=x.device).unsqueeze(0).expand(
+                    sq, -1
+                )
+                positions = torch.arange(1, sq + 1, device=x.device).unsqueeze(1)
+                causal_mask = (
+                    torch.where(
+                        causal_mask >= positions // self.compress_ratio, float("-inf"), 0.0
                     )
-                    positions = torch.arange(1, sq + 1, device=x.device).unsqueeze(1)
-                    causal_mask = (
-                        torch.where(
-                            causal_mask >= positions // self.compress_ratio, float("-inf"), 0.0
-                        )
-                        .unsqueeze(0)
-                        .expand(b, -1, -1)
-                    )  # [b, sq, n_compressed]
+                    .unsqueeze(0)
+                    .expand(b, -1, -1)
+                )  # [b, sq, n_compressed]
 
-                    if self.training and torch.is_grad_enabled():
-                        q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
-                            x_det, qr_det, packed_seq_params
-                        )
-                        indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
-                        # compressed_kv is [n, b, hn]; expand to [n, b, np, hn] for loss
-                        key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, np, -1)
-                        # ``FusedDSAIndexerLoss`` does not accept a separate
-                        # indexer_softmax_scale; apply it here via the
-                        # weights-scaling trick so the effective weights match
-                        # the pre-scale-split behaviour.
-                        weights_for_unfused = weights_indexer * self.indexer.softmax_scale
-                        topk_indices_compressed, indexer_loss = FusedDSAIndexerLoss.apply(
-                            q_indexer,
-                            weights_for_unfused,
-                            k_indexer,
-                            query.detach(),
-                            key_for_loss.detach(),
-                            self.softmax_scale,
-                            min(self.indexer.index_topk, n_compressed),
-                            indexer_loss_coeff,
-                            causal_mask,
-                            getattr(self.config, "dsa_indexer_use_sparse_loss", True),
-                            self.indexer.pg_collection,
-                        )
-                        if indexer_loss_coeff > 0:
-                            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                                loss=indexer_loss,
-                                layer_number=self.layer_number,
-                                num_layers=self.config.num_layers
-                                + (self.config.mtp_num_layers or 0),
-                            )
-                    else:
-                        _, topk_indices_compressed = self.indexer(
-                            x_det, qr_det, mask=causal_mask, packed_seq_params=packed_seq_params
-                        )
-
-                    n_valid_per_pos = positions // self.compress_ratio  # [sq, 1]
-                    valid = topk_indices_compressed < n_valid_per_pos
-                    compress_topk_idxs = torch.where(
-                        valid, topk_indices_compressed + offset, torch.tensor(-1, device=x.device)
+                if self.training and torch.is_grad_enabled():
+                    q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
+                        x_det, qr_det, packed_seq_params
                     )
+                    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+                    # compressed_kv is [n, b, hn]; expand to [n, b, np, hn] for loss
+                    key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, np, -1)
+                    # ``FusedDSAIndexerLoss`` does not accept a separate
+                    # indexer_softmax_scale; apply it here via the
+                    # weights-scaling trick so the effective weights match
+                    # the pre-scale-split behaviour.
+                    weights_for_unfused = weights_indexer * self.indexer.softmax_scale
+                    topk_indices_compressed, indexer_loss = FusedDSAIndexerLoss.apply(
+                        q_indexer,
+                        weights_for_unfused,
+                        k_indexer,
+                        query.detach(),
+                        key_for_loss.detach(),
+                        self.softmax_scale,
+                        min(self.indexer.index_topk, n_compressed),
+                        indexer_loss_coeff,
+                        causal_mask,
+                        getattr(self.config, "dsa_indexer_use_sparse_loss", True),
+                        self.indexer.pg_collection,
+                    )
+                    if indexer_loss_coeff > 0:
+                        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                            loss=indexer_loss,
+                            layer_number=self.layer_number,
+                            num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
+                        )
                 else:
-                    compress_topk_idxs = get_compress_topk_idxs(
-                        self.compress_ratio, b, sq, offset, query.device
+                    _, topk_indices_compressed = self.indexer(
+                        x_det, qr_det, mask=causal_mask, packed_seq_params=packed_seq_params
                     )
 
-                topk_idxs = torch.cat([window_idxs, compress_topk_idxs], dim=-1)
-                nvtx_range_pop("compressed_indices")
+                n_valid_per_pos = positions // self.compress_ratio  # [sq, 1]
+                valid = topk_indices_compressed < n_valid_per_pos
+                compress_topk_idxs = torch.where(
+                    valid, topk_indices_compressed + offset, torch.tensor(-1, device=x.device)
+                )
             else:
-                topk_idxs = window_idxs
+                compress_topk_idxs = get_compress_topk_idxs(
+                    self.compress_ratio, b, sq, offset, query.device
+                )
 
-            topk_idxs = topk_idxs.int()
+            topk_idxs = torch.cat([window_idxs, compress_topk_idxs], dim=-1)
+            nvtx_range_pop("compressed_indices")
+        else:
+            topk_idxs = window_idxs
 
-            # --- Step 5: Sparse attention ---
-            nvtx_range_push("sparse_attn_kernel")
+        topk_idxs = topk_idxs.int().contiguous()
+
+        # --- Step 5: Sparse attention ---
+        nvtx_range_push("sparse_attn_kernel")
+        if self.csa_backend == 'tilelang_official':
+            output = tilelang_compressed_sparse_attn(
+                query, kv_full, self.attn_sink.float(), topk_idxs, self.softmax_scale
+            )
+        elif self.csa_backend == 'flashmla_official':
+            output = flashmla_compressed_sparse_attn(
+                query, kv_full, self.attn_sink.float(), topk_idxs, self.softmax_scale
+            )
+        elif self.csa_backend == 'cudnn_dsa' and self.training and torch.is_grad_enabled():
+            output = _CudnnDSASparseAttention.apply(
+                query, kv_full, self.attn_sink.float(), topk_idxs, self.softmax_scale
+            )
+        else:
             output = unfused_compressed_sparse_attn(
                 query, kv_full, self.attn_sink.float(), topk_idxs, self.softmax_scale
             )
-            nvtx_range_pop("sparse_attn_kernel")
-
-        else:
-            raise ValueError("Fused path is not supported for CompressedSparseAttention")
+        nvtx_range_pop("sparse_attn_kernel")
 
         # --- Step 6: Attach indexer loss ---
         if indexer_loss is not None and self.training and torch.is_grad_enabled():
