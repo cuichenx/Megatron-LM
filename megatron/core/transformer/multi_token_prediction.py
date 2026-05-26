@@ -1077,22 +1077,47 @@ class MultiTokenPredictionLayer(MegatronModule):
         return hidden_states
 
     def _checkpointed_forward(self, forward_func, *args, **kwargs):
+        checkpoint_args = []
+        arg_tensor_slots = []
+        kwarg_tensor_slots = []
+
+        for arg_idx, value in enumerate(args):
+            if torch.is_tensor(value):
+                arg_tensor_slots.append((arg_idx, len(checkpoint_args)))
+                checkpoint_args.append(value)
+
+        for key, value in kwargs.items():
+            if torch.is_tensor(value):
+                kwarg_tensor_slots.append((key, len(checkpoint_args)))
+                checkpoint_args.append(value)
+
+        def tensor_only_forward(*checkpoint_values):
+            restored_args = list(args)
+            checkpoint_kwargs = dict(kwargs)
+
+            for arg_idx, checkpoint_idx in arg_tensor_slots:
+                restored_args[arg_idx] = checkpoint_values[checkpoint_idx]
+
+            for key, checkpoint_idx in kwarg_tensor_slots:
+                checkpoint_kwargs[key] = checkpoint_values[checkpoint_idx]
+
+            return forward_func(*restored_args, **checkpoint_kwargs)
+
         def checkpoint_handler():
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
             if self.config.fp8:
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 return te_checkpoint(
-                    forward_func,
+                    tensor_only_forward,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
-                    *args,
-                    **kwargs,
+                    *checkpoint_args,
                 )
             else:
                 return tensor_parallel.checkpoint(
-                    forward_func, self.config.distribute_saved_activations, *args, *kwargs.values()
+                    tensor_only_forward, self.config.distribute_saved_activations, *checkpoint_args
                 )
 
         if self.config.recompute_method == 'uniform':
