@@ -182,7 +182,9 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+    args = parse_and_validate_args(
+        args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'}, initialize_globals=False
+    )
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(full_config, train_valid_test_datasets_provider,
              ModelType.encoder_or_decoder,

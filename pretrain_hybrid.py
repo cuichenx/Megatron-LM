@@ -569,13 +569,16 @@ if __name__ == "__main__":
     args = parse_and_validate_args(
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+        initialize_globals=False,
     )
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-        model_cfg = hybrid_config_from_args(args, model_config_cls=ModelOptHybridModelConfig)
+        model_cfg = hybrid_config_from_args(
+            args, model_config_cls=ModelOptHybridModelConfig, defer_vocab_size=True
+        )
     else:
-        model_cfg = hybrid_config_from_args(args)
+        model_cfg = hybrid_config_from_args(args, defer_vocab_size=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
         full_config,

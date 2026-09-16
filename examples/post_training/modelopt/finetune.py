@@ -574,6 +574,7 @@ if __name__ == "__main__":
     args = parse_and_validate_args(
         extra_args_provider=add_finetune_args,
         args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
+        initialize_globals=False,
     )
     pretrain(
         pretrain_cfg_container_from_args(args),

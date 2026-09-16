@@ -495,7 +495,9 @@ if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
 
     args = parse_and_validate_args(
-        extra_args_provider=add_vlm_extra_args, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}
+        extra_args_provider=add_vlm_extra_args,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+        initialize_globals=False,
     )
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(

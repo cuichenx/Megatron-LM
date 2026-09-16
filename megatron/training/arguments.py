@@ -91,9 +91,9 @@ def parse_and_validate_args(
 ):
     """Prepare CLI inputs, optionally retaining the legacy runtime bootstrap.
 
-    Callers may disable ``initialize_globals`` to construct the config
-    container before explicitly initializing runtime services. Args remain
-    registered for entrypoint/provider compatibility during migration.
+    Training entrypoints disable ``initialize_globals`` so they can construct
+    the config container before pretrain initializes runtime services. Args are
+    still registered for entrypoint/provider compatibility during migration.
     """
     args = parse_args(extra_args_provider, ignore_unknown_args)
 

@@ -277,7 +277,9 @@ def model_provider(
 if __name__ == "__main__":
     
     train_valid_test_datasets_provider.is_distributed = True
-    args = parse_and_validate_args(args_defaults={}, extra_args_provider=add_mimo_args)
+    args = parse_and_validate_args(
+        args_defaults={}, extra_args_provider=add_mimo_args, initialize_globals=False
+    )
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(
         full_config,
