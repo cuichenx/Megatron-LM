@@ -434,13 +434,20 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
 
 
 def gpt_config_from_args(
-    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type = GPTModelConfig
+    args: Namespace,
+    config: TransformerConfig | None = None,
+    model_config_cls: type = GPTModelConfig,
+    *,
+    defer_vocab_size: bool = False,
 ) -> Any:
     """Create a GPTModelConfig (or a compatible subclass) from the `args` Namespace.
 
     `model_config_cls` lets callers reuse this same arg-derivation logic for
     subclasses that only override metadata (e.g. `builder`) and add no new fields,
     such as `ModelOptModelConfig`.
+
+    ``defer_vocab_size`` allows config-first training entrypoints to resolve
+    tokenizer-derived vocabulary during runtime initialization.
     """
     assert issubclass(model_config_cls, GPTModelConfig)
 
@@ -479,15 +486,22 @@ def gpt_config_from_args(
         kwargs["vocab_size"] = args.padded_vocab_size
         kwargs["should_pad_vocab"] = False
     else:
-        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
-        kwargs["vocab_size"] = args.vocab_size
+        if not defer_vocab_size:
+            assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        # With padding enabled, legacy tokenizer setup derives the model's
+        # vocabulary from the tokenizer, even if --vocab-size was supplied.
+        kwargs["vocab_size"] = None if defer_vocab_size and args.pad_vocab_size else args.vocab_size
         kwargs["should_pad_vocab"] = True
 
     return model_config_cls(**kwargs)
 
 
 def hybrid_config_from_args(
-    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type = HybridModelConfig
+    args: Namespace,
+    config: TransformerConfig | None = None,
+    model_config_cls: type = HybridModelConfig,
+    *,
+    defer_vocab_size: bool = False,
 ) -> Any:
     """Create a HybridModelConfig (or a compatible subclass) from the `args` Namespace.
 
@@ -530,8 +544,9 @@ def hybrid_config_from_args(
         kwargs["vocab_size"] = args.padded_vocab_size
         kwargs["should_pad_vocab"] = False
     else:
-        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
-        kwargs["vocab_size"] = args.vocab_size
+        if not defer_vocab_size:
+            assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        kwargs["vocab_size"] = None if defer_vocab_size and args.pad_vocab_size else args.vocab_size
         kwargs["should_pad_vocab"] = True
 
     return model_config_cls(**kwargs)

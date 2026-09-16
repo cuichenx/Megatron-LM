@@ -2,22 +2,33 @@
 
 """Megatron global variables."""
 
+from __future__ import annotations
+
 import os
 import signal
 import sys
-import torch
-
 from datetime import timedelta
+from typing import TYPE_CHECKING
+
+import torch
 
 from megatron.core import Timers
 from megatron.core.config import set_experimental_flag
 from megatron.core.energy_monitor import EnergyMonitor
 from megatron.core.jit import disable_jit_fuser
-from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator, unset_num_microbatches_calculator
+from megatron.core.num_microbatches_calculator import (
+    init_num_microbatches_calculator,
+    unset_num_microbatches_calculator,
+)
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 
+if TYPE_CHECKING:
+    from megatron.training.config import PretrainConfigContainer
+
 _GLOBAL_ARGS = None
+_GLOBAL_CFG = None
+_GLOBAL_RUNTIME_INITIALIZED = False
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_WANDB_WRITER = None
@@ -32,6 +43,47 @@ def get_args():
     """Return arguments."""
     _ensure_var_is_initialized(_GLOBAL_ARGS, 'args')
     return _GLOBAL_ARGS
+
+
+def get_cfg() -> PretrainConfigContainer:
+    """Return the active training configuration container."""
+    _ensure_var_is_initialized(_GLOBAL_CFG, 'config')
+    return _GLOBAL_CFG
+
+
+def set_cfg(cfg: PretrainConfigContainer) -> None:
+    """Register the container before constructing training runtime services."""
+    global _GLOBAL_CFG
+    assert cfg is not None, 'config must not be None'
+    assert _GLOBAL_CFG is None or _GLOBAL_CFG is cfg, 'config is already initialized'
+    _GLOBAL_CFG = cfg
+
+
+def initialize_training_globals(cfg: PretrainConfigContainer) -> None:
+    """Initialize runtime services after training configuration construction.
+
+    Legacy entrypoints may already have initialized the services. The args
+    dependency here is the compatibility boundary for the first migration
+    step; service ownership is migrated separately.
+    """
+    from megatron.training.models import GPTModelConfig, HybridModelConfig
+
+    set_cfg(cfg)
+    args = get_args()
+    if not _GLOBAL_RUNTIME_INITIALIZED:
+        _initialize_runtime_services(args)
+
+    cfg.tokenizer.padded_vocab_size = args.padded_vocab_size
+
+    # Tokenizer initialization can resolve a vocabulary that was unavailable
+    # when the model config was constructed. Match the legacy adapter's
+    # precedence, including vocabulary supplied by checkpoint arguments.
+    if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)) and cfg.model.vocab_size is None:
+        if args.padded_vocab_size is not None:
+            cfg.model.vocab_size = args.padded_vocab_size
+            cfg.model.should_pad_vocab = False
+        else:
+            raise ValueError('Model vocabulary must be resolved before model construction')
 
 
 def get_tokenizer():
@@ -134,13 +186,22 @@ def _graceful_shutdown(signum, frame):
     sys.exit(0)
 
 
-def set_global_variables(args, build_tokenizer=True):
-    """Set args, tokenizer, tensorboard-writer, adlr-autoresume, and timers."""
+def set_global_variables(args, build_tokenizer=True, *, initialize_runtime=True):
+    """Register args and optionally construct the legacy runtime services."""
 
     assert args is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     set_args(args)
+
+    if initialize_runtime:
+        _initialize_runtime_services(args, build_tokenizer=build_tokenizer)
+
+
+def _initialize_runtime_services(args, *, build_tokenizer=True):
+    """Construct services independently of CLI parsing and config construction."""
+    global _GLOBAL_RUNTIME_INITIALIZED
+    assert not _GLOBAL_RUNTIME_INITIALIZED, 'runtime services are already initialized'
 
     if args.step_batch_size_schedule is not None:
         print(f'> using step batch size schedule: {args.step_batch_size_schedule}')
@@ -178,6 +239,8 @@ def set_global_variables(args, build_tokenizer=True):
     if args.disable_jit_fuser:
         disable_jit_fuser()
 
+    _GLOBAL_RUNTIME_INITIALIZED = True
+
 
 def unset_global_variables():
     """Unset global vars.
@@ -186,6 +249,8 @@ def unset_global_variables():
     """
 
     global _GLOBAL_ARGS
+    global _GLOBAL_CFG
+    global _GLOBAL_RUNTIME_INITIALIZED
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     global _GLOBAL_TOKENIZER
     global _GLOBAL_TENSORBOARD_WRITER
@@ -198,6 +263,8 @@ def unset_global_variables():
     global _GLOBAL_TELEMETRY_HANDLE
 
     _GLOBAL_ARGS = None
+    _GLOBAL_CFG = None
+    _GLOBAL_RUNTIME_INITIALIZED = False
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
     _GLOBAL_TOKENIZER = None
     _GLOBAL_TENSORBOARD_WRITER = None
@@ -532,6 +599,12 @@ def _set_telemetry(args):
 
 
 def destroy_global_vars():
+    global _GLOBAL_CFG
+    _GLOBAL_CFG = None
+
+    global _GLOBAL_RUNTIME_INITIALIZED
+    _GLOBAL_RUNTIME_INITIALIZED = False
+
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = None
 
