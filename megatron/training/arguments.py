@@ -12,7 +12,6 @@ from pathlib import Path
 
 import torch
 
-from megatron.core.config import set_experimental_flag
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
@@ -86,15 +85,8 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
 
     return parser
 
-def parse_and_validate_args(
-    extra_args_provider=None, ignore_unknown_args=False, args_defaults={}, *, initialize_globals=True
-):
-    """Prepare CLI inputs, optionally retaining the legacy runtime bootstrap.
-
-    Callers may disable ``initialize_globals`` to construct the config
-    container before explicitly initializing runtime services. Args remain
-    registered for entrypoint/provider compatibility during migration.
-    """
+def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
+    """Parse and validate arguments, then initialize global variables."""
     args = parse_args(extra_args_provider, ignore_unknown_args)
 
     if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
@@ -118,14 +110,7 @@ def parse_and_validate_args(
 
     # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
-    if initialize_globals:
-        set_global_variables(args)
-    else:
-        set_global_variables(args, initialize_runtime=False)
-        # Config construction itself can use experimental model features.
-        # This flag does not construct any training runtime services.
-        if args.enable_experimental:
-            set_experimental_flag(True)
+    set_global_variables(args)
 
     return args
 
