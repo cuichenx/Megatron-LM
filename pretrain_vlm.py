@@ -39,6 +39,7 @@ from megatron.training import (
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.global_vars import initialize_training_globals
 from pretrain_gpt import loss_func
 
 
@@ -497,9 +498,9 @@ if __name__ == "__main__":
     args = parse_and_validate_args(
         extra_args_provider=add_vlm_extra_args,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        initialize_globals=False,
     )
     full_config = pretrain_cfg_container_from_args(args)
+    initialize_training_globals(full_config)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

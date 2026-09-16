@@ -35,7 +35,7 @@ from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=u
     ArgumentGroupFactory,
     core_transformer_config_from_args,
 )
-from megatron.training.global_vars import set_global_variables
+from megatron.training.global_vars import set_args
 from megatron.training.utils import (
     get_device_arch_version,
     print_rank_0,
@@ -86,14 +86,11 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
 
     return parser
 
-def parse_and_validate_args(
-    extra_args_provider=None, ignore_unknown_args=False, args_defaults={}, *, initialize_globals=True
-):
-    """Prepare CLI inputs, optionally retaining the legacy runtime bootstrap.
+def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
+    """Prepare and register CLI inputs without constructing runtime services.
 
-    Training entrypoints disable ``initialize_globals`` so they can construct
-    the config container before pretrain initializes runtime services. Args are
-    still registered for entrypoint/provider compatibility during migration.
+    Checkpoint overrides and validation precede config construction. Callers
+    initialize runtime services explicitly after preparing their configuration.
     """
     args = parse_args(extra_args_provider, ignore_unknown_args)
 
@@ -116,16 +113,11 @@ def parse_and_validate_args(
     else:
         validate_args(args, args_defaults)
 
-    # set global args, build tokenizer, and set adlr-autoresume,
-    # tensorboard-writer, and timers.
-    if initialize_globals:
-        set_global_variables(args)
-    else:
-        set_global_variables(args, initialize_runtime=False)
-        # Config construction itself can use experimental model features.
-        # This flag does not construct any training runtime services.
-        if args.enable_experimental:
-            set_experimental_flag(True)
+    set_args(args)
+    # Model config construction can use experimental features. Enabling the
+    # feature gate does not construct any runtime services.
+    if args.enable_experimental:
+        set_experimental_flag(True)
 
     return args
 

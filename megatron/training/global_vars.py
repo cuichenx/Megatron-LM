@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import signal
 import sys
+from argparse import Namespace
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -27,8 +28,7 @@ if TYPE_CHECKING:
     from megatron.training.config import PretrainConfigContainer
 
 _GLOBAL_ARGS = None
-_GLOBAL_CFG = None
-_GLOBAL_RUNTIME_INITIALIZED = False
+_GLOBAL_FULL_CONFIG = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_WANDB_WRITER = None
@@ -45,33 +45,29 @@ def get_args():
     return _GLOBAL_ARGS
 
 
-def get_cfg() -> PretrainConfigContainer:
-    """Return the active training configuration container."""
-    _ensure_var_is_initialized(_GLOBAL_CFG, 'config')
-    return _GLOBAL_CFG
+def get_full_config() -> PretrainConfigContainer | None:
+    """Return the full training config, or None for callers without a container."""
+    return _GLOBAL_FULL_CONFIG
 
 
-def set_cfg(cfg: PretrainConfigContainer) -> None:
-    """Register the container before constructing training runtime services."""
-    global _GLOBAL_CFG
-    assert cfg is not None, 'config must not be None'
-    assert _GLOBAL_CFG is None or _GLOBAL_CFG is cfg, 'config is already initialized'
-    _GLOBAL_CFG = cfg
+def set_full_config(cfg_container: PretrainConfigContainer | None) -> None:
+    """Register the full training config used by runtime and checkpoint consumers."""
+    global _GLOBAL_FULL_CONFIG
+    _GLOBAL_FULL_CONFIG = cfg_container
 
 
 def initialize_training_globals(cfg: PretrainConfigContainer) -> None:
     """Initialize runtime services after training configuration construction.
 
-    Legacy entrypoints may already have initialized the services. The args
-    dependency here is the compatibility boundary for the first migration
-    step; service ownership is migrated separately.
+    Call once, after constructing the container and before model construction.
+    Services still consume normalized args at this migration boundary; their
+    configuration ownership is migrated separately.
     """
     from megatron.training.models import GPTModelConfig, HybridModelConfig
 
-    set_cfg(cfg)
+    set_full_config(cfg)
     args = get_args()
-    if not _GLOBAL_RUNTIME_INITIALIZED:
-        _initialize_runtime_services(args)
+    initialize_runtime_services(args)
 
     cfg.tokenizer.padded_vocab_size = args.padded_vocab_size
 
@@ -186,22 +182,19 @@ def _graceful_shutdown(signum, frame):
     sys.exit(0)
 
 
-def set_global_variables(args, build_tokenizer=True, *, initialize_runtime=True):
-    """Register args and optionally construct the legacy runtime services."""
+def set_global_variables(args, build_tokenizer=True):
+    """Register args and construct runtime services for args-only callers."""
 
     assert args is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     set_args(args)
 
-    if initialize_runtime:
-        _initialize_runtime_services(args, build_tokenizer=build_tokenizer)
+    initialize_runtime_services(args, build_tokenizer=build_tokenizer)
 
 
-def _initialize_runtime_services(args, *, build_tokenizer=True):
+def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True) -> None:
     """Construct services independently of CLI parsing and config construction."""
-    global _GLOBAL_RUNTIME_INITIALIZED
-    assert not _GLOBAL_RUNTIME_INITIALIZED, 'runtime services are already initialized'
 
     if args.step_batch_size_schedule is not None:
         print(f'> using step batch size schedule: {args.step_batch_size_schedule}')
@@ -239,8 +232,6 @@ def _initialize_runtime_services(args, *, build_tokenizer=True):
     if args.disable_jit_fuser:
         disable_jit_fuser()
 
-    _GLOBAL_RUNTIME_INITIALIZED = True
-
 
 def unset_global_variables():
     """Unset global vars.
@@ -249,8 +240,7 @@ def unset_global_variables():
     """
 
     global _GLOBAL_ARGS
-    global _GLOBAL_CFG
-    global _GLOBAL_RUNTIME_INITIALIZED
+    global _GLOBAL_FULL_CONFIG
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     global _GLOBAL_TOKENIZER
     global _GLOBAL_TENSORBOARD_WRITER
@@ -263,8 +253,7 @@ def unset_global_variables():
     global _GLOBAL_TELEMETRY_HANDLE
 
     _GLOBAL_ARGS = None
-    _GLOBAL_CFG = None
-    _GLOBAL_RUNTIME_INITIALIZED = False
+    _GLOBAL_FULL_CONFIG = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
     _GLOBAL_TOKENIZER = None
     _GLOBAL_TENSORBOARD_WRITER = None
@@ -599,11 +588,8 @@ def _set_telemetry(args):
 
 
 def destroy_global_vars():
-    global _GLOBAL_CFG
-    _GLOBAL_CFG = None
-
-    global _GLOBAL_RUNTIME_INITIALIZED
-    _GLOBAL_RUNTIME_INITIALIZED = False
+    global _GLOBAL_FULL_CONFIG
+    _GLOBAL_FULL_CONFIG = None
 
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = None

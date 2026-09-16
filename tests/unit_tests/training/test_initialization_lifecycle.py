@@ -17,9 +17,8 @@ from megatron.training.config.training_config import TokenizerConfig
 @pytest.fixture
 def isolated_globals(monkeypatch):
     """Avoid changing services owned by the distributed test harness."""
-    for name in ("_GLOBAL_ARGS", "_GLOBAL_CFG", "_GLOBAL_TOKENIZER"):
+    for name in ("_GLOBAL_ARGS", "_GLOBAL_FULL_CONFIG", "_GLOBAL_TOKENIZER"):
         monkeypatch.setattr(global_vars, name, None)
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUNTIME_INITIALIZED", False)
 
 
 def _runtime_args():
@@ -40,43 +39,71 @@ def _runtime_args():
     )
 
 
-@pytest.mark.parametrize("initialize_globals", [False, True])
-def test_parse_selects_explicit_or_legacy_bootstrap(monkeypatch, initialize_globals):
-    args = Namespace(use_checkpoint_args=False, yaml_cfg=None, enable_experimental=False)
-    monkeypatch.setattr(arguments, "parse_args", Mock(return_value=args))
-    validate = Mock()
-    legacy = Mock()
-    monkeypatch.setattr(arguments, "validate_args", validate)
-    monkeypatch.setattr(arguments, "set_global_variables", legacy)
-
-    assert arguments.parse_and_validate_args(initialize_globals=initialize_globals) is args
-    validate.assert_called_once_with(args, {})
-    if initialize_globals:
-        legacy.assert_called_once_with(args)
-    else:
-        legacy.assert_called_once_with(args, initialize_runtime=False)
-
-
-def test_default_parse_preserves_legacy_bootstrap(monkeypatch):
-    args = Namespace(use_checkpoint_args=False, yaml_cfg=None, enable_experimental=False)
+@pytest.mark.parametrize("experimental", [False, True])
+def test_parse_only_prepares_args(monkeypatch, isolated_globals, experimental):
+    args = Namespace(use_checkpoint_args=False, yaml_cfg=None, enable_experimental=experimental)
     monkeypatch.setattr(arguments, "parse_args", Mock(return_value=args))
     monkeypatch.setattr(arguments, "validate_args", Mock())
-    legacy = Mock()
-    monkeypatch.setattr(arguments, "set_global_variables", legacy)
+    services = Mock()
+    experimental_flag = Mock()
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", services)
+    monkeypatch.setattr(arguments, "set_experimental_flag", experimental_flag)
 
     assert arguments.parse_and_validate_args() is args
-    legacy.assert_called_once_with(args)
+    assert global_vars.get_args() is args
+    services.assert_not_called()
+    assert global_vars.get_full_config() is None
+    if experimental:
+        experimental_flag.assert_called_once_with(True)
+    else:
+        experimental_flag.assert_not_called()
 
 
-def test_deferred_bootstrap_only_registers_args(monkeypatch, isolated_globals):
+def test_args_only_bootstrap_registers_args_and_constructs_services(monkeypatch, isolated_globals):
     args = _runtime_args()
     initialize = Mock()
-    monkeypatch.setattr(global_vars, "_initialize_runtime_services", initialize)
-    global_vars.set_global_variables(args, initialize_runtime=False)
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
+    global_vars.set_global_variables(args)
     assert global_vars.get_args() is args
-    initialize.assert_not_called()
+    initialize.assert_called_once_with(args, build_tokenizer=True)
     with pytest.raises(AssertionError, match="already initialized"):
-        global_vars.set_global_variables(args, initialize_runtime=False)
+        global_vars.set_global_variables(args)
+
+
+def test_parse_restores_checkpoint_args_before_validation_and_config(monkeypatch, isolated_globals):
+    from megatron.training import checkpointing
+
+    args = Namespace(
+        use_checkpoint_args=True,
+        yaml_cfg=None,
+        enable_experimental=False,
+        load="resume",
+        pretrained_checkpoint="pretrained",
+        non_persistent_ckpt_type=None,
+        padded_vocab_size=None,
+    )
+    events = []
+    monkeypatch.setattr(arguments, "parse_args", Mock(return_value=args))
+
+    def restore(received_args, load_arg="load"):
+        assert received_args is args
+        events.append(load_arg)
+        if load_arg == "load":
+            received_args.padded_vocab_size = 512
+
+    def validate(received_args, defaults):
+        assert received_args.padded_vocab_size == 512
+        events.append("validate")
+
+    monkeypatch.setattr(checkpointing, "load_args_from_checkpoint", restore)
+    monkeypatch.setattr(arguments, "validate_args", validate)
+    runtime = Mock()
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", runtime)
+
+    assert arguments.parse_and_validate_args() is args
+    assert events == ["pretrained_checkpoint", "load", "validate"]
+    assert global_vars.get_args().padded_vocab_size == 512
+    runtime.assert_not_called()
 
 
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
@@ -92,7 +119,7 @@ def test_vocabulary_resolves_after_config_construction(
     model_cfg = adapter(
         args,
         config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
-        defer_vocab_size=True,
+        vocab_size_from_tokenizer=True,
     )
     assert model_cfg.vocab_size == checkpoint_vocab
     cfg = SimpleNamespace(model=model_cfg, tokenizer=TokenizerConfig())
@@ -100,22 +127,18 @@ def test_vocabulary_resolves_after_config_construction(
 
     def initialize_services(received_args):
         # The full container has already been registered when tokenizer work starts.
-        assert global_vars.get_cfg() is cfg
+        assert global_vars.get_full_config() is cfg
         assert received_args is args
         if received_args.padded_vocab_size is None:
             received_args.padded_vocab_size = 128
-        monkeypatch.setattr(global_vars, "_GLOBAL_RUNTIME_INITIALIZED", True)
 
     initialize = Mock(side_effect=initialize_services)
-    monkeypatch.setattr(global_vars, "_initialize_runtime_services", initialize)
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
     global_vars.initialize_training_globals(cfg)
 
     assert model_cfg.vocab_size == (128 if checkpoint_vocab is None else checkpoint_vocab)
     assert model_cfg.should_pad_vocab is False
     assert cfg.tokenizer.padded_vocab_size == model_cfg.vocab_size
-    initialize.assert_called_once_with(args)
-
-    global_vars.initialize_training_globals(cfg)
     initialize.assert_called_once_with(args)
 
 
@@ -140,7 +163,7 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
 
         def record(received_args, service=name):
             assert received_args is args
-            assert global_vars.get_cfg() is cfg
+            assert global_vars.get_full_config() is cfg
             calls.append(service)
 
         monkeypatch.setattr(global_vars, name, record)
@@ -168,22 +191,11 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
     )
 
 
-def test_legacy_services_are_not_constructed_again(monkeypatch, isolated_globals):
-    global_vars.set_args(_runtime_args())
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUNTIME_INITIALIZED", True)
-    initialize = Mock()
-    monkeypatch.setattr(global_vars, "_initialize_runtime_services", initialize)
-    cfg = SimpleNamespace(model=None, tokenizer=TokenizerConfig())
-    global_vars.initialize_training_globals(cfg)
-    assert global_vars.get_cfg() is cfg
-    initialize.assert_not_called()
-
-
 def test_custom_model_config_does_not_receive_vocabulary(monkeypatch, isolated_globals):
     args = _runtime_args()
     args.padded_vocab_size = 128
     global_vars.set_args(args)
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUNTIME_INITIALIZED", True)
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", Mock())
     custom_model = SimpleNamespace()
     global_vars.initialize_training_globals(
         SimpleNamespace(model=custom_model, tokenizer=TokenizerConfig())
@@ -211,15 +223,14 @@ def test_config_first_matches_legacy_tokenizer_and_model_inputs(
     legacy_tokenizer = build_tokenizer(legacy_args)
     legacy_model = adapter(legacy_args, config=deepcopy(transformer))
 
-    model = adapter(args, config=deepcopy(transformer), defer_vocab_size=True)
+    model = adapter(args, config=deepcopy(transformer), vocab_size_from_tokenizer=True)
     cfg = SimpleNamespace(model=model, tokenizer=TokenizerConfig())
     global_vars.set_args(args)
 
     def initialize(received_args):
         global_vars._build_tokenizer(received_args)
-        monkeypatch.setattr(global_vars, "_GLOBAL_RUNTIME_INITIALIZED", True)
 
-    monkeypatch.setattr(global_vars, "_initialize_runtime_services", initialize)
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
     global_vars.initialize_training_globals(cfg)
     assert model.as_dict() == legacy_model.as_dict()
     assert cfg.tokenizer.padded_vocab_size == legacy_args.padded_vocab_size
@@ -232,7 +243,7 @@ def test_explicit_model_vocabulary_is_not_overwritten(monkeypatch, isolated_glob
     args = _runtime_args()
     args.padded_vocab_size = 128
     global_vars.set_args(args)
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUNTIME_INITIALIZED", True)
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", Mock())
     model = GPTModelConfig(
         transformer=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
         vocab_size=512,
@@ -255,15 +266,120 @@ def test_config_cleanup_allows_new_run(monkeypatch, isolated_globals, cleanup):
     monkeypatch.setattr(global_vars, "unset_num_microbatches_calculator", clear_calculator)
     first = SimpleNamespace(model=None)
     second = SimpleNamespace(model=None)
-    global_vars.set_cfg(first)
-    with pytest.raises(AssertionError, match="already initialized"):
-        global_vars.set_cfg(second)
+    global_vars.set_full_config(first)
+    assert global_vars.get_full_config() is first
 
     getattr(global_vars, cleanup)()
     if cleanup == "unset_global_variables":
         clear_calculator.assert_called_once_with()
-    with pytest.raises(AssertionError, match="not initialized"):
-        global_vars.get_cfg()
-    assert not global_vars._GLOBAL_RUNTIME_INITIALIZED
-    global_vars.set_cfg(second)
-    assert global_vars.get_cfg() is second
+    assert global_vars.get_full_config() is None
+    global_vars.set_full_config(second)
+    assert global_vars.get_full_config() is second
+
+
+@pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
+@pytest.mark.parametrize("raw_vocab", [None, 133])
+def test_tokenizer_vocabulary_is_authoritative_when_padding(
+    monkeypatch, isolated_globals, adapter, raw_vocab
+):
+    """Tokenizer metadata/special tokens may differ from an optional CLI size."""
+    from megatron.core.tokenizers import MegatronTokenizer
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.rank = 0
+    args.tokenizer_type = "HuggingFaceTokenizer"
+    args.vocab_size = raw_vocab
+    args.tensor_model_parallel_size = 2
+    args.make_vocab_size_divisible_by = 128
+    tokenizer = SimpleNamespace(vocab_size=261)
+    factory = Mock(return_value=tokenizer)
+    monkeypatch.setattr(MegatronTokenizer, "from_pretrained", factory)
+    model = adapter(
+        args,
+        config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
+        vocab_size_from_tokenizer=True,
+    )
+    assert model.vocab_size is None
+    factory.assert_not_called()
+    cfg = SimpleNamespace(model=model, tokenizer=TokenizerConfig())
+    global_vars.set_args(args)
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", global_vars._build_tokenizer)
+
+    global_vars.initialize_training_globals(cfg)
+
+    assert global_vars.get_full_config() is cfg
+    assert model.vocab_size == cfg.tokenizer.padded_vocab_size == 512
+    assert model.should_pad_vocab is False
+    assert global_vars.get_tokenizer() is tokenizer
+    factory.assert_called_once()
+
+
+@pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
+@pytest.mark.parametrize("cli_vocab,expected", [(None, 512), (768, 768)])
+def test_checkpoint_vocabulary_precedence_survives_runtime_setup(
+    monkeypatch, isolated_globals, adapter, cli_vocab, expected
+):
+    """Exercise real checkpoint-argument restoration, not a prefilled namespace."""
+    from megatron.training import checkpointing
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.rank = 0
+    args.load = "checkpoint"
+    args.tokenizer_type = "NullTokenizer"
+    args.vocab_size = 133
+    args.padded_vocab_size = cli_vocab
+    args.tensor_model_parallel_size = 2
+    checkpoint_args = Namespace(padded_vocab_size=512)
+    state = {"args": checkpoint_args, "iteration": 17, "checkpoint_version": 3.0}
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        Mock(return_value=(state, "checkpoint", False, None)),
+    )
+
+    checkpointing.load_args_from_checkpoint(args)
+    assert args.iteration == 17
+    model = adapter(
+        args,
+        config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
+        vocab_size_from_tokenizer=True,
+    )
+    assert model.vocab_size == expected
+    cfg = SimpleNamespace(model=model, tokenizer=TokenizerConfig())
+    global_vars.set_args(args)
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", global_vars._build_tokenizer)
+    global_vars.initialize_training_globals(cfg)
+
+    assert model.vocab_size == cfg.tokenizer.padded_vocab_size == expected
+    assert model.should_pad_vocab is False
+    assert global_vars.get_tokenizer().vocab_size == 133
+
+
+@pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
+def test_known_unpadded_vocabulary_needs_no_tokenizer_for_config(adapter):
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.vocab_size = 133
+    args.pad_vocab_size = False
+    model = adapter(
+        args,
+        config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
+        vocab_size_from_tokenizer=True,
+    )
+    assert model.vocab_size == 133
+    # Preserve the existing model-builder padding policy for raw vocabulary.
+    assert model.should_pad_vocab is True
+
+
+def test_public_registry_allows_args_only_checkpoint_consumers(isolated_globals):
+    assert global_vars.get_full_config() is None
+    cfg = SimpleNamespace(model=None, tokenizer=TokenizerConfig())
+    global_vars.set_full_config(cfg)
+    assert global_vars.get_full_config() is cfg
+    global_vars.set_full_config(None)
+    assert global_vars.get_full_config() is None

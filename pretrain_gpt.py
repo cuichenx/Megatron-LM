@@ -42,8 +42,8 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.gpt import GPTModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -77,6 +77,7 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
+from megatron.training.global_vars import initialize_training_globals
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -581,17 +582,17 @@ if __name__ == "__main__":
     args = parse_and_validate_args(
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        initialize_globals=False,
     )
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
         model_cfg = gpt_config_from_args(
-            args, model_config_cls=ModelOptModelConfig, defer_vocab_size=True
+            args, model_config_cls=ModelOptModelConfig, vocab_size_from_tokenizer=True
         )
     else:
-        model_cfg = gpt_config_from_args(args, defer_vocab_size=True)
+        model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    initialize_training_globals(full_config)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

@@ -51,6 +51,7 @@ from megatron.training import (
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.global_vars import initialize_training_globals
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 
 # modelopt distillation
@@ -568,6 +569,7 @@ if __name__ == "__main__":
     )
 
     full_config = pretrain_cfg_container_from_args(args)
+    initialize_training_globals(full_config)
     pretrain(full_config,
              train_valid_test_datasets_provider,
              ModelType.encoder_or_decoder,

@@ -10,7 +10,6 @@ import torch
 
 import megatron
 from megatron.core import mpu, tensor_parallel
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.t5_dataset import (
     T5MaskedWordPieceDataset,
@@ -25,9 +24,11 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_local_block_spec,
     get_t5_encoder_with_transformer_engine_block_spec,
 )
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.global_vars import initialize_training_globals
 from pretrain_gpt import loss_func
 
 """
@@ -271,9 +272,10 @@ if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
 
     args = parse_and_validate_args(
-        args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'}, initialize_globals=False
+        args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'}
     )
     full_config = pretrain_cfg_container_from_args(args)
+    initialize_training_globals(full_config)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

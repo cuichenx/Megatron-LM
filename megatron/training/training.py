@@ -1592,11 +1592,10 @@ def pretrain(
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
-    # The container exists before tokenizer, microbatch, and logger setup.
-    # Legacy callers that bootstrapped during argument parsing are supported.
-    from megatron.training.global_vars import initialize_training_globals
+    # Entrypoints construct runtime services after preparing their config.
+    from megatron.training.global_vars import set_full_config
 
-    initialize_training_globals(cfg_container)
+    set_full_config(cfg_container)
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
