@@ -1,0 +1,232 @@
+{
+  "schema": 1,
+  "common": {
+    "--num-layers": "2",
+    "--hidden-size": "128",
+    "--num-attention-heads": "4",
+    "--ffn-hidden-size": "512",
+    "--seq-length": "32",
+    "--max-position-embeddings": "64",
+    "--micro-batch-size": "1",
+    "--global-batch-size": "4",
+    "--train-iters": "4",
+    "--lr-decay-iters": "4",
+    "--lr-warmup-iters": "1",
+    "--eval-iters": "1",
+    "--eval-interval": "2",
+    "--mock-data": true,
+    "--tokenizer-type": "NullTokenizer",
+    "--vocab-size": "133",
+    "--num-workers": "0",
+    "--bf16": true,
+    "--lr": "0.0001",
+    "--min-lr": "0.00001",
+    "--seed": "1234",
+    "--log-interval": "1",
+    "--no-one-logger": true,
+    "--data-cache-path": "{run}/dataset-cache"
+  },
+  "required": [
+    "config.model",
+    "config.optimizer",
+    "config.ddp",
+    "config.scheduler",
+    "config.checkpoint",
+    "config.logger",
+    "config.tokenizer",
+    "config.train",
+    "config.validation",
+    "runtime.microbatch_inputs",
+    "runtime.tokenizer_inputs",
+    "runtime.tokenizer",
+    "runtime.services",
+    "runtime.batch",
+    "consumer.dataset",
+    "consumer.scheduler"
+  ],
+  "cases": [
+    {
+      "name": "hybrid_known",
+      "entrypoint": "pretrain_hybrid.py",
+      "tier": "builder",
+      "options": {"--hybrid-layer-pattern": "**", "--padded-vocab-size": "512"}
+    },
+    {
+      "name": "hybrid_derived",
+      "entrypoint": "pretrain_hybrid.py",
+      "tier": "builder",
+      "options": {"--hybrid-layer-pattern": "**", "--tokenizer-type": "HuggingFaceTokenizer", "--tokenizer-model": "{fixtures}/tokenizer"}
+    },
+    {
+      "name": "defaults",
+      "tier": "builder",
+      "options": {}
+    },
+    {
+      "name": "known_padded",
+      "tier": "builder",
+      "options": {
+        "--padded-vocab-size": "512"
+      }
+    },
+    {
+      "name": "known_unpadded",
+      "tier": "builder",
+      "options": {
+        "--no-pad-vocab-size": true
+      }
+    },
+    {
+      "name": "hf_derived",
+      "tier": "builder",
+      "options": {
+        "--tokenizer-type": "HuggingFaceTokenizer",
+        "--tokenizer-model": "{fixtures}/tokenizer"
+      }
+    },
+    {
+      "name": "hf_unpadded",
+      "tier": "builder",
+      "options": {
+        "--tokenizer-type": "HuggingFaceTokenizer",
+        "--tokenizer-model": "{fixtures}/tokenizer",
+        "--no-pad-vocab-size": true
+      }
+    },
+    {
+      "name": "optimizer_ddp",
+      "tier": "builder",
+      "options": {
+        "--adam-beta1": "0.8",
+        "--adam-beta2": "0.95",
+        "--adam-eps": "0.000001",
+        "--clip-grad": "0.5",
+        "--weight-decay": "0.02",
+        "--overlap-grad-reduce": true,
+        "--use-distributed-optimizer": true,
+        "--ddp-bucket-size": "100000"
+      }
+    },
+    {
+      "name": "sample_scheduler",
+      "tier": "builder",
+      "options": {
+        "--train-iters": false,
+        "--lr-decay-iters": false,
+        "--lr-warmup-iters": false,
+        "--train-samples": "32",
+        "--lr-decay-samples": "32",
+        "--lr-warmup-samples": "8",
+        "--lr-decay-style": "cosine",
+        "--weight-decay-incr-style": "linear",
+        "--start-weight-decay": "0.01",
+        "--end-weight-decay": "0.1"
+      }
+    },
+    {
+      "name": "step_batch",
+      "tier": "builder",
+      "batch_points": [0, 4, 7, 8, 9, 16],
+      "options": {
+        "--global-batch-size": false,
+        "--step-batch-size-schedule": "0:2 256:4"
+      }
+    },
+    {
+      "name": "legacy_ramp",
+      "tier": "builder",
+      "options": {
+        "--rampup-batch-size": [
+          "2",
+          "2",
+          "16"
+        ]
+      }
+    },
+    {
+      "name": "data_masks",
+      "tier": "builder",
+      "options": {
+        "--reset-position-ids": true,
+        "--reset-attention-mask": true,
+        "--eod-mask-loss": true,
+        "--split": "80,10,10"
+      }
+    },
+    {
+      "name": "checkpoint_logging",
+      "tier": "builder",
+      "options": {
+        "--no-save-optim": true,
+        "--no-save-rng": true,
+        "--no-load-optim": true,
+        "--no-load-rng": true,
+        "--tensorboard-dir": "{run}/tensorboard",
+        "--tensorboard-queue-size": "5"
+      }
+    },
+    {
+      "name": "checkpoint_cli",
+      "tier": "builder",
+      "needs_checkpoint": true,
+      "options": {
+        "--load": "{checkpoint}",
+        "--hidden-size": "256",
+        "--padded-vocab-size": "1024"
+      }
+    },
+    {
+      "name": "checkpoint_args",
+      "tier": "builder",
+      "needs_checkpoint": true,
+      "options": {
+        "--load": "{checkpoint}",
+        "--use-checkpoint-args": true,
+        "--hidden-size": "256",
+        "--padded-vocab-size": "1024"
+      }
+    },
+    {
+      "name": "runtime_fresh",
+      "tier": "runtime",
+      "options": {
+        "--save": "{run}/checkpoint",
+        "--save-interval": "2",
+        "--exit-interval": "2",
+        "--ckpt-format": "torch_dist"
+      }
+    },
+    {
+      "name": "runtime_resume",
+      "tier": "runtime",
+      "needs_checkpoint": true,
+      "options": {
+        "--load": "{checkpoint}",
+        "--use-checkpoint-args": true,
+        "--exit-on-missing-checkpoint": true
+      }
+    },
+    {
+      "name": "runtime_tp2_pp2_dp2",
+      "tier": "runtime",
+      "ranks": 8,
+      "options": {
+        "--tensor-model-parallel-size": "2",
+        "--pipeline-model-parallel-size": "2",
+        "--num-layers": "4",
+        "--exit-interval": "2",
+        "--save": "{run}/checkpoint",
+        "--save-interval": "2",
+        "--ckpt-format": "torch_dist"
+      }
+    },
+    {
+      "name": "invalid_batch_conflict",
+      "tier": "builder",
+      "expected_error": "Cannot specify both --step-batch-size-schedule and --global-batch-size",
+      "options": {
+        "--step-batch-size-schedule": "0:2 256:4"
+      }
+    }
+  ]
+}
