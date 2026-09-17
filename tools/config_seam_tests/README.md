@@ -10,7 +10,9 @@ Use the same supported MLM development environment for both revisions (Python 3.
 PyTorch, Transformer Engine, tokenizer dependencies, and CUDA). No dependency installation
 or remote model download is performed by the harness. `uv` should use that existing environment.
 
-Prepare two clean worktrees at exact commits, then run from this directory:
+Freeze one main commit and compare it with that same commit plus the PR. Latest
+main is not required; do not advance the baseline between runs. Prepare two clean
+worktrees at exact commits, then run from this directory:
 
 ```bash
 uv run --no-sync python -m unittest -v test_snapshot
@@ -18,7 +20,7 @@ uv run --no-sync python compare_config_seams.py \
   --baseline /path/to/main-worktree \
   --candidate /path/to/pr-worktree \
   --baseline-revision cfa9e20d2658844dd84a07f2ccd34d7e62ab5552 \
-  --candidate-revision 62a0a6c05640f28dfbbe3ee8c2bd11e7818b709a \
+  --candidate-revision c92551aa6f63c64a5a495a94b784c19ad0966a8c \
   --environment-id YOUR_CONTAINER_REFERENCE_OR_DIGEST \
   --output /path/to/new-result-directory \
   --cases defaults known_padded known_unpadded hf_derived hf_unpadded
@@ -81,8 +83,8 @@ tests and training/resume/convergence/performance validation, not replaces them.
 
 ## Results and extension
 
-See [the PR7418 results](RESULTS.md) for the first pinned main/head matrix and
-separate branch-point control, including the upstream differences found.
+See [the PR7418 results](RESULTS.md) for the pinned before/after comparisons and
+historical main/head matrix, including the unrelated upstream differences found.
 See [scenario coverage](SCENARIOS.md) for the expanded recipe matrix, pinned source
 provenance, GPU requirements and limits of each testing tier.
 
@@ -90,9 +92,10 @@ provenance, GPU requirements and limits of each testing tier.
 identifier, per-case outcome and field-level differences. Case subdirectories contain
 expanded argv, per-rank snapshots and logs. A missing capture, timeout or failed baseline
 is an error, not a pass. Inspect baseline failures separately from candidate regressions.
-Both sides failing does not establish equivalence. A configuration mismatch against
-current main can originate in changes absent from an older PR head; attribute it with a
-separate PR-base comparison, never silently whitelist it.
+Both sides failing does not establish equivalence. Comparing a newer main against
+an older PR head can include unrelated upstream differences. Use a shared fixed
+base for the equivalence gate; retain any historical mismatches and their attribution,
+never silently whitelist them.
 
 Keep the harness/comparison rules separate from migration PRs. Add explicit capture
 adapters if APIs move, without reproducing production calculations. Add a named manifest
