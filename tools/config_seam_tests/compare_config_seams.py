@@ -24,6 +24,9 @@ def git(repo: Path, *args: str) -> str:
 
 def materialize_case(manifest: dict, case: dict) -> dict:
     """Expand a case's explicit CLI overrides without duplicating MLM derivation."""
+    for name, value in case.get("environment", {}).items():
+        if name != "CUDA_DEVICE_MAX_CONNECTIONS" or not isinstance(value, str):
+            raise ValueError(f"Unsupported case environment override: {name}")
     options = manifest["common"] | case["options"]
     argv = []
     for flag, value in options.items():
@@ -87,6 +90,7 @@ def run_case(repo: Path, case: dict, destination: Path, fixtures: Path, checkpoi
             "NEMO_LENS_ENABLED": "false",
         }
     )
+    environment.update(case.get("environment", {}))
     with (destination / "launcher.log").open("w") as stream:
         process = subprocess.Popen(
             command, cwd=repo, env=environment, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True
@@ -252,7 +256,7 @@ def main() -> None:
                 )
                 for label in ("baseline", "candidate")
             }
-            required = list(manifest["required"])
+            required = [*manifest["required"], *case.get("required", [])]
             if case["tier"] == "runtime":
                 required += ["consumer.model", "consumer.ddp", "consumer.optimizer"]
                 if "--save" in case["argv"]:

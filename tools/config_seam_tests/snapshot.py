@@ -15,9 +15,12 @@ def qualified_name(value: Any) -> str:
     return f"{value.__module__}.{value.__qualname__}"
 
 
-def encode(value: Any, roots: dict[str, str] | None = None) -> Any:
+def encode(value: Any, roots: dict[str, str] | None = None, references: dict[int, dict] | None = None) -> Any:
     """Encode supported semantic values; reject unsupported objects, never use repr."""
     roots = roots or {}
+    references = references or {}
+    if id(value) in references:
+        return references[id(value)]
     if isinstance(value, enum.Enum):
         return {"enum": qualified_name(type(value)), "name": value.name}
     if value is None or type(value) in (bool, int):
@@ -39,7 +42,7 @@ def encode(value: Any, roots: dict[str, str] | None = None) -> Any:
             "type": qualified_name(type(value)),
             "fields": {
                 field.name: (
-                    encode(getattr(value, field.name), roots)
+                    encode(getattr(value, field.name), roots, references)
                     if hasattr(value, field.name)
                     else {"missing_attribute": True}
                 )
@@ -48,17 +51,17 @@ def encode(value: Any, roots: dict[str, str] | None = None) -> Any:
         }
     if isinstance(value, dict):
         if all(isinstance(key, str) for key in value):
-            return {key: encode(item, roots) for key, item in sorted(value.items())}
-        pairs = [[encode(key, roots), encode(item, roots)] for key, item in value.items()]
+            return {key: encode(item, roots, references) for key, item in sorted(value.items())}
+        pairs = [[encode(key, roots, references), encode(item, roots, references)] for key, item in value.items()]
         return {"mapping": pairs}
     if isinstance(value, (tuple, list)):
-        items = [encode(item, roots) for item in value]
+        items = [encode(item, roots, references) for item in value]
         return {"tuple": items} if isinstance(value, tuple) else items
     if isinstance(value, functools.partial):
         return {
-            "partial": encode(value.func, roots),
-            "args": encode(value.args, roots),
-            "kwargs": encode(value.keywords, roots),
+            "partial": encode(value.func, roots, references),
+            "args": encode(value.args, roots, references),
+            "kwargs": encode(value.keywords, roots, references),
         }
     if inspect.ismethod(value):
         owner = value.__self__ if isinstance(value.__self__, type) else type(value.__self__)
@@ -66,8 +69,8 @@ def encode(value: Any, roots: dict[str, str] | None = None) -> Any:
     if inspect.isfunction(value):
         return {
             "callable": qualified_name(value),
-            "defaults": encode(value.__defaults__, roots),
-            "closure": [encode(cell.cell_contents, roots) for cell in (value.__closure__ or ())],
+            "defaults": encode(value.__defaults__, roots, references),
+            "closure": [encode(cell.cell_contents, roots, references) for cell in (value.__closure__ or ())],
         }
     if inspect.isbuiltin(value) or isinstance(value, type):
         return {"callable": qualified_name(value)}
@@ -89,7 +92,7 @@ def encode(value: Any, roots: dict[str, str] | None = None) -> Any:
                 metadata[key] = getattr(value, key)
             except (AttributeError, NotImplementedError):
                 metadata[key] = {"unavailable": True}
-        return encode(metadata, roots)
+        return encode(metadata, roots, references)
     raise TypeError(f"Unsupported snapshot type: {qualified_name(type(value))}")
 
 

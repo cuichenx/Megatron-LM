@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--run-root", type=Path, required=True)
     options = parser.parse_args()
     case = json.loads(options.case_file.read_text())
+    entrypoint = case.get("entrypoint", "pretrain_gpt.py")
     rank = int(os.environ.get("RANK", "0"))
     options.output.mkdir(parents=True, exist_ok=True)
     options.run_root.mkdir(parents=True, exist_ok=True)
@@ -38,8 +39,8 @@ def main() -> None:
     }
     result = {"schema": 1, "case": case["name"], "tier": case["tier"], "rank": rank, "captures": {}, "status": "error"}
 
-    def record(name, value):
-        result["captures"].setdefault(name, []).append(encode(value, roots))
+    def record(name, value, references=None):
+        result["captures"].setdefault(name, []).append(encode(value, roots, references))
 
     def observe_call(owner, name, capture_name, excluded=(), after=None):
         original = getattr(owner, name)
@@ -49,7 +50,22 @@ def main() -> None:
         def wrapped(*args, **kwargs):
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
-            record(capture_name, {key: value for key, value in bound.arguments.items() if key not in excluded})
+            references = None
+            if capture_name == "consumer.ddp":
+                # Layouts refer to live Parameters. Compare their model-local identity and
+                # metadata, not weights, addresses, or just shapes (which can alias).
+                references = {
+                    id(parameter): {
+                        "parameter": parameter_name,
+                        "shape": list(parameter.shape),
+                        "dtype": str(parameter.dtype),
+                        "requires_grad": parameter.requires_grad,
+                    }
+                    for parameter_name, parameter in bound.arguments["module"].named_parameters()
+                }
+            record(
+                capture_name, {key: value for key, value in bound.arguments.items() if key not in excluded}, references
+            )
             output = original(*args, **kwargs)
             if after is not None:
                 after(args, output)
@@ -77,6 +93,7 @@ def main() -> None:
             "python": sys.version.split()[0],
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
+            "cuda_device_max_connections": os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS"),
         }
         observe_call(globals_, "init_num_microbatches_calculator", "runtime.microbatch_inputs")
 
@@ -154,6 +171,11 @@ def main() -> None:
         training.pretrain = entry
         if case["tier"] == "runtime":
             observe_call(GPTModel, "__init__", "consumer.model", excluded=("self",))
+            if entrypoint == "pretrain_vlm.py":
+                from megatron.core.models.multimodal.llava_model import LLaVAModel
+
+                observe_call(LLaVAModel, "__init__", "consumer.vlm", excluded=("self",))
+                observe_call(LLaVAModel, "freeze", "consumer.vlm_freeze", excluded=("self",))
             observe_call(DistributedDataParallel, "__init__", "consumer.ddp", excluded=("self", "module"))
             observe_call(training, "get_megatron_optimizer", "consumer.optimizer", excluded=("model_chunks", "timers"))
             original_save = training.save_checkpoint
@@ -185,8 +207,7 @@ def main() -> None:
             for token, value in replacements.items():
                 argument = argument.replace(token, value)
             argv.append(argument)
-        entrypoint = case.get("entrypoint", "pretrain_gpt.py")
-        if entrypoint not in ("pretrain_gpt.py", "pretrain_hybrid.py"):
+        if entrypoint not in ("pretrain_gpt.py", "pretrain_hybrid.py", "pretrain_vlm.py"):
             raise ValueError("Unsupported entrypoint")
         sys.argv = [str(options.repo / entrypoint), *argv]
         runpy.run_path(sys.argv[0], run_name="__main__")

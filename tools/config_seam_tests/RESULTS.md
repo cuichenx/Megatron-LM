@@ -1,6 +1,8 @@
 # PR7418 configuration comparison
 
-Run date: 2026-09-17 (UTC). Status: complete for this manifest and these pinned revisions.
+Run date: 2026-09-17 (UTC). Both the initial 19-case matrix and the additional
+19 recipe-inspired cases are complete at the pinned revisions. Results for the
+expansion are recorded separately below; 38 cases in total.
 
 ## Pinned inputs
 
@@ -87,3 +89,56 @@ equivalence. Logger/checkpoint captures are not an exhaustive audit of every con
 Neither PR7418 nor upstream main was modified. Raw logs and environment-specific
 artifacts are not published; each local `report.json` contains source trees, per-file
 harness hashes, fixture hashes, case outcomes, and every field difference.
+
+## Recipe-matrix expansion
+
+The [19 additional scenarios](SCENARIOS.md) use the same pinned main/head revisions
+and development environment. All 19 additions completed on both revisions: twelve
+builders, three single-rank runtime cases and four two-rank runtime cases. There are
+zero execution/capture errors in the corrected runs and 19 strict mismatches confined
+to attributed upstream fields. Across both delivery stages, all 38 cases ran: 37
+strict mismatches and one expected CLI rejection. This is not a strict equality pass.
+
+The explicit Mamba hybrid-stack case exposes two further upstream schema changes:
+
+| Field under `hybrid_stack_spec.submodules` | Main/head difference | Upstream change |
+| --- | --- | --- |
+| `gdn2_layer` | Present on main, absent on head | [PR7311](https://github.com/NVIDIA/Megatron-LM/pull/7311), commit `a1a09b084` |
+| `mla_fused_down_proj_layer` | Present on main, absent on head | [PR7304](https://github.com/NVIDIA/Megatron-LM/pull/7304), commit `42b8a6911` |
+
+The Hybrid spec/block files are unchanged between the PR branch point and PR head.
+This case has eight difference paths; the other completed added builders have six.
+Full-recompute/fine-tune runtime cases have 17 paths each; MoE EP2, CP2, and TP2/SP
+have 34 each; the interleaved PP2/VPP2 case has 56 because multiple model/DDP chunks
+are captured on each rank. The VLM case has 27 paths, including its separate vision,
+projection and language constructor configs. Fine-tuning restored weights at iteration 0 and trained
+through iteration 2 on both sides, independently of the initial resume case.
+The actual VLM runs completed training/evaluation with frozen vision encoders, 28×28
+mock images, 32 text tokens and 37 decoder positions; the required VLM constructor,
+freeze-policy and multimodal dataset captures are present on both sides.
+
+Draft-to-final corrections, not waived failures:
+
+- Distributed-optimizer layouts contain live Parameter keys. The first draft rejected
+  them. The corrected adapter preserves all layout fields and describes references by
+  model-local parameter name, shape, dtype and trainability. All four distributed
+  cases were rerun with that adapter; tensor values are not compared.
+- The source Qwen-Next recipe contains obsolete attention/weight-decay selectors;
+  their current equivalents are documented in SCENARIOS.md.
+- FSDP2 requires a different CUDA connection setting, untied embeddings, and disabled
+  gradient-accumulation fusion. Both sides rejected the incomplete draft; the corrected
+  configuration completes. This remains a builder-only test.
+- The VLM draft mixed mutually exclusive common/encoder layer-depth flags. The corrected
+  case uses explicit encoder and decoder depths and completed its rerun.
+
+The original single-GPU expansion run and subsequent corrected-case reruns have
+different harness/manifest hashes, retained in their private reports. Every compared
+baseline/candidate pair uses identical harness code and fixtures. The original
+branch-point control above was not repeated for the expanded matrix; source-level
+attribution does not turn main/head mismatches into exact passes.
+
+Thirteen final harness self-tests and targeted isort/Black/ruff checks pass. Full
+repository pre-commit was rerun in a disposable container clone: existing baseline
+formatting/pylint failures remain outside the harness, with no unrelated changes
+retained. A workstation attempt additionally hit its old Git's unsupported
+`ls-files --deduplicate`; the container run supplied the repository-wide check.

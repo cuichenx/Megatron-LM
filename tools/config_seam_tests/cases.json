@@ -1,5 +1,26 @@
 {
   "schema": 1,
+  "sources": {
+    "mlm-llama": "examples/llama/train_llama3_8b_h100_fp8.sh",
+    "mlm-fp16": "tests/functional_tests/test_cases/gpt/gpt3_mcore_tp1_pp2_fp16/model_config.yaml",
+    "mlm-moe-overlap": "tests/functional_tests/test_cases/moe/gpt3_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_1node/model_config.yaml",
+    "mlm-moe-capacity": "tests/unit_tests/transformer/moe/test_token_dispatcher.py",
+    "mlm-mamba": "examples/mamba/train.sh",
+    "mlm-selective-recompute": "tests/functional_tests/test_cases/moe/gpt3_mcore_te_tp2_pp2_ep4_etp1_selective_recompute_experimental/model_config.yaml",
+    "mlm-full-recompute": "tests/functional_tests/test_cases/gpt/gpt3_mcore_te_tp1_pp1_uniform_full_recompute/model_config.yaml",
+    "mlm-fsdp2": "tests/functional_tests/test_cases/gpt/gpt3_mcore_tp1_pp1_fsdp2_resume_torch_dist_te/model_config.yaml",
+    "mlm-vlm": "tests/functional_tests/test_cases/multimodal-llava/multimodal_llava_mcore_te_tp1_pp1/model_config.yaml",
+    "mlm-context-parallel": "tests/functional_tests/test_cases/gpt/gpt3_mcore_te_tp2_pp2_cp2_1node/model_config.yaml",
+    "mlm-interleaved": "tests/functional_tests/test_cases/gpt/gpt3_mcore_te_tp1_pp4_vp1_1node/model_config.yaml",
+    "zoo-mixtral": "model_configs/benchmarking/Mixtral-8x7B.yaml",
+    "zoo-qwen3": "model_configs/benchmarking/Qwen3-30B-A3B.yaml",
+    "zoo-deepseek": "model_configs/benchmarking/DeepSeek-V3.yaml",
+    "zoo-qwen-next": "model_configs/benchmarking/Qwen3-Next-80B-A3B.yaml"
+  },
+  "source_revisions": {
+    "mlm": {"repository": "https://github.com/NVIDIA/Megatron-LM", "revision": "cfa9e20d2658844dd84a07f2ccd34d7e62ab5552"},
+    "zoo": {"repository": "https://github.com/yanring/Megatron-MoE-ModelZoo", "revision": "c2d0171e5d8c9f4da9b00bd44c05317fa20a4fcd"}
+  },
   "common": {
     "--num-layers": "2",
     "--hidden-size": "128",
@@ -218,6 +239,233 @@
         "--save": "{run}/checkpoint",
         "--save-interval": "2",
         "--ckpt-format": "torch_dist"
+      }
+    },
+    {
+      "name": "dense_llama_gqa",
+      "tier": "builder",
+      "source": "mlm-llama",
+      "options": {
+        "--group-query-attention": true, "--num-query-groups": "2",
+        "--position-embedding-type": "rope", "--rotary-base": "1000000",
+        "--swiglu": true, "--normalization": "RMSNorm", "--norm-epsilon": "0.000001",
+        "--disable-bias-linear": true, "--untie-embeddings-and-output-weights": true,
+        "--attention-dropout": "0", "--hidden-dropout": "0",
+        "--decoupled-lr": "0.0002", "--decoupled-min-lr": "0.00002"
+      }
+    },
+    {
+      "name": "fp16_static_scaling",
+      "tier": "builder",
+      "source": "mlm-fp16",
+      "options": {
+        "--bf16": false, "--fp16": true, "--loss-scale": "128",
+        "--transformer-impl": "local", "--apply-query-key-layer-scaling": true,
+        "--attention-softmax-in-fp32": true
+      }
+    },
+    {
+      "name": "fp8_delayed",
+      "tier": "builder",
+      "source": "mlm-llama",
+      "options": {
+        "--fp8-format": "hybrid", "--fp8-recipe": "delayed",
+        "--fp8-amax-history-len": "16", "--fp8-amax-compute-algo": "max",
+        "--fp8-param-gather": true, "--use-distributed-optimizer": true
+      }
+    },
+    {
+      "name": "moe_mixtral_aux",
+      "tier": "builder",
+      "source": "zoo-mixtral",
+      "options": {
+        "--num-experts": "4", "--moe-router-topk": "2",
+        "--moe-router-load-balancing-type": "aux_loss", "--moe-aux-loss-coeff": "0.01",
+        "--moe-grouped-gemm": true, "--moe-token-dispatcher-type": "alltoall",
+        "--moe-permute-fusion": true, "--group-query-attention": true, "--num-query-groups": "2",
+        "--normalization": "RMSNorm", "--swiglu": true, "--disable-bias-linear": true,
+        "--position-embedding-type": "rope", "--untie-embeddings-and-output-weights": true
+      }
+    },
+    {
+      "name": "moe_qwen3_topk",
+      "tier": "builder",
+      "source": "zoo-qwen3",
+      "options": {
+        "--num-experts": "8", "--moe-router-topk": "4", "--moe-ffn-hidden-size": "128",
+        "--moe-router-load-balancing-type": "aux_loss", "--moe-aux-loss-coeff": "0.001",
+        "--moe-router-dtype": "fp32", "--moe-grouped-gemm": true,
+        "--moe-token-dispatcher-type": "alltoall", "--qk-layernorm": true,
+        "--group-query-attention": true, "--num-query-groups": "2",
+        "--normalization": "RMSNorm", "--swiglu": true, "--disable-bias-linear": true,
+        "--position-embedding-type": "rope", "--rotary-base": "1000000",
+        "--tokenizer-type": "HuggingFaceTokenizer", "--tokenizer-model": "{fixtures}/tokenizer"
+      }
+    },
+    {
+      "name": "moe_deepseek_mla",
+      "tier": "builder",
+      "source": "zoo-deepseek",
+      "options": {
+        "--multi-latent-attention": true, "--q-lora-rank": "32", "--kv-lora-rank": "32",
+        "--qk-head-dim": "16", "--qk-pos-emb-head-dim": "16", "--v-head-dim": "16",
+        "--position-embedding-type": "rope", "--qk-layernorm": true,
+        "--normalization": "RMSNorm", "--swiglu": true, "--disable-bias-linear": true,
+        "--num-experts": "4", "--moe-router-topk": "2", "--moe-layer-freq": "([0]+[1])",
+        "--moe-ffn-hidden-size": "128", "--moe-shared-expert-intermediate-size": "128",
+        "--moe-router-load-balancing-type": "seq_aux_loss", "--moe-aux-loss-coeff": "0.0001",
+        "--moe-router-num-groups": "2", "--moe-router-group-topk": "1",
+        "--moe-router-score-function": "sigmoid", "--moe-router-topk-scaling-factor": "2.5",
+        "--moe-router-enable-expert-bias": true, "--moe-router-bias-update-rate": "0.001",
+        "--moe-router-dtype": "fp32", "--moe-grouped-gemm": true,
+        "--moe-token-dispatcher-type": "alltoall"
+      }
+    },
+    {
+      "name": "moe_capacity_drop",
+      "tier": "builder",
+      "source": "mlm-moe-capacity",
+      "options": {
+        "--num-experts": "4", "--moe-router-topk": "2",
+        "--moe-router-load-balancing-type": "aux_loss", "--moe-aux-loss-coeff": "0.01",
+        "--moe-expert-capacity-factor": "1.25", "--moe-pad-expert-input-to-capacity": true,
+        "--moe-token-drop-policy": "probs", "--moe-token-dispatcher-type": "alltoall",
+        "--moe-grouped-gemm": true, "--disable-bias-linear": true
+      }
+    },
+    {
+      "name": "moe_sinkhorn",
+      "tier": "builder",
+      "source": "mlm-moe-overlap",
+      "options": {
+        "--num-experts": "4", "--moe-router-topk": "1",
+        "--moe-router-load-balancing-type": "sinkhorn", "--moe-aux-loss-coeff": "0",
+        "--moe-grouped-gemm": true, "--disable-bias-linear": true
+      }
+    },
+    {
+      "name": "qwen_next_gdn",
+      "tier": "builder",
+      "source": "zoo-qwen-next",
+      "options": {
+        "--num-layers": "4", "--experimental-attention-variant": "gdn", "--linear-attention-freq": "2",
+        "--linear-conv-kernel-dim": "4", "--linear-key-head-dim": "32", "--linear-value-head-dim": "32",
+        "--linear-num-key-heads": "2", "--linear-num-value-heads": "4",
+        "--attention-output-gate": true, "--qk-layernorm": true, "--apply-layernorm-1p": true,
+        "--normalization": "RMSNorm", "--swiglu": true, "--disable-bias-linear": true,
+        "--position-embedding-type": "rope", "--rotary-percent": "0.25", "--rotary-base": "10000000",
+        "--num-experts": "4", "--moe-router-topk": "2", "--moe-ffn-hidden-size": "128",
+        "--moe-shared-expert-intermediate-size": "128", "--moe-shared-expert-gate": true,
+        "--moe-router-load-balancing-type": "aux_loss", "--moe-aux-loss-coeff": "0.001",
+        "--moe-token-dispatcher-type": "alltoall", "--moe-grouped-gemm": true,
+        "--apply-wd-to-qk-layernorm": true, "--mtp-num-layers": "1",
+        "--mtp-loss-scaling-factor": "0.1", "--enable-experimental": true
+      }
+    },
+    {
+      "name": "hybrid_mamba",
+      "entrypoint": "pretrain_hybrid.py",
+      "tier": "builder",
+      "source": "mlm-mamba",
+      "options": {
+        "--num-layers": false, "--hybrid-layer-pattern": "M-*", "--position-embedding-type": "none",
+        "--normalization": "RMSNorm", "--disable-bias-linear": true,
+        "--spec": ["megatron.core.models.hybrid.hybrid_layer_specs", "hybrid_stack_spec"]
+      }
+    },
+    {
+      "name": "selective_recompute",
+      "tier": "builder",
+      "source": "mlm-selective-recompute",
+      "options": {
+        "--recompute-granularity": "selective", "--recompute-modules": ["core_attn", "layernorm"],
+        "--normalization": "RMSNorm", "--disable-bias-linear": true
+      }
+    },
+    {
+      "name": "torch_fsdp2_config",
+      "tier": "builder",
+      "source": "mlm-fsdp2",
+      "environment": {"CUDA_DEVICE_MAX_CONNECTIONS": "32"},
+      "options": {
+        "--use-torch-fsdp2": true, "--ckpt-format": "torch_dist",
+        "--no-gradient-accumulation-fusion": true, "--untie-embeddings-and-output-weights": true
+      }
+    },
+    {
+      "name": "runtime_full_recompute",
+      "tier": "runtime",
+      "source": "mlm-full-recompute",
+      "options": {
+        "--recompute-granularity": "full", "--recompute-method": "uniform", "--recompute-num-layers": "1",
+        "--exit-interval": "2", "--attention-dropout": "0", "--hidden-dropout": "0"
+      }
+    },
+    {
+      "name": "runtime_finetune",
+      "tier": "runtime",
+      "source": "zoo-mixtral",
+      "needs_checkpoint": true,
+      "options": {
+        "--load": "{checkpoint}", "--finetune": true, "--no-load-optim": true, "--no-load-rng": true,
+        "--override-opt-param-scheduler": true, "--lr": "0.00005", "--exit-interval": "2"
+      }
+    },
+    {
+      "name": "runtime_vlm_frozen_vision",
+      "entrypoint": "pretrain_vlm.py",
+      "tier": "runtime",
+      "source": "mlm-vlm",
+      "required": ["consumer.vlm", "consumer.vlm_freeze"],
+      "options": {
+        "--num-layers": false, "--decoder-num-layers": "2",
+        "--encoder-num-layers": "1", "--img-h": "28", "--img-w": "28", "--patch-dim": "14",
+        "--ckpt-format": "torch", "--freeze-ViT": true, "--exit-interval": "2",
+        "--attention-dropout": "0", "--hidden-dropout": "0", "--no-gradient-accumulation-fusion": true
+      }
+    },
+    {
+      "name": "runtime_moe_ep2",
+      "tier": "runtime",
+      "ranks": 2,
+      "source": "mlm-moe-overlap",
+      "options": {
+        "--expert-model-parallel-size": "2", "--num-experts": "4", "--moe-router-topk": "2",
+        "--moe-router-load-balancing-type": "aux_loss", "--moe-aux-loss-coeff": "0.01",
+        "--moe-grouped-gemm": true, "--moe-token-dispatcher-type": "alltoall",
+        "--use-distributed-optimizer": true, "--overlap-grad-reduce": true, "--overlap-param-gather": true,
+        "--disable-bias-linear": true, "--exit-interval": "2"
+      }
+    },
+    {
+      "name": "runtime_context_parallel2",
+      "tier": "runtime",
+      "ranks": 2,
+      "source": "mlm-context-parallel",
+      "options": {
+        "--context-parallel-size": "2", "--attention-backend": "flash",
+        "--attention-dropout": "0", "--hidden-dropout": "0", "--exit-interval": "2"
+      }
+    },
+    {
+      "name": "runtime_tp2_sequence_overlap",
+      "tier": "runtime",
+      "ranks": 2,
+      "source": "mlm-moe-overlap",
+      "options": {
+        "--tensor-model-parallel-size": "2", "--sequence-parallel": true,
+        "--use-distributed-optimizer": true, "--overlap-grad-reduce": true, "--overlap-param-gather": true,
+        "--group-query-attention": true, "--num-query-groups": "2", "--exit-interval": "2"
+      }
+    },
+    {
+      "name": "runtime_interleaved_pipeline",
+      "tier": "runtime",
+      "ranks": 2,
+      "source": "mlm-interleaved",
+      "options": {
+        "--num-layers": "4", "--pipeline-model-parallel-size": "2",
+        "--num-layers-per-virtual-pipeline-stage": "1", "--exit-interval": "2"
       }
     },
     {

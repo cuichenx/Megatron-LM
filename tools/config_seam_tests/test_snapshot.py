@@ -2,9 +2,11 @@
 """CPU-only harness self-checks, independent of MLM's GPU pytest fixtures."""
 
 import copy
+import json
 import unittest
+from pathlib import Path
 
-from compare_config_seams import compare_runs, validate
+from compare_config_seams import compare_runs, materialize_case, validate
 from snapshot import differences, encode
 
 
@@ -32,6 +34,41 @@ class SnapshotTests(unittest.TestCase):
 
     def test_required_capture(self):
         self.assertTrue(validate({"schema": 1, "status": "ok", "captures": {}}, ["config.model"]))
+
+    def test_manifest_sources_and_arguments(self):
+        manifest = json.loads(Path(__file__).with_name("cases.json").read_text())
+        names = [case["name"] for case in manifest["cases"]]
+        self.assertEqual(len(names), len(set(names)))
+        for case in manifest["cases"]:
+            with self.subTest(case=case["name"]):
+                if "source" in case:
+                    self.assertIn(case["source"], manifest["sources"])
+                    self.assertIn(case["source"].split("-")[0], manifest["source_revisions"])
+                self.assertIn(case["tier"], ("builder", "runtime"))
+                self.assertGreater(case.get("ranks", 1), 0)
+                self.assertTrue(all(isinstance(item, str) for item in materialize_case(manifest, case)["argv"]))
+
+    def test_scenario_required_capture(self):
+        snapshot = {"schema": 1, "status": "ok", "captures": {"consumer.model": [{}]}}
+        self.assertTrue(validate(snapshot, ["consumer.model", "consumer.vlm_freeze"]))
+
+    def test_case_environment_is_bounded(self):
+        manifest = {"common": {}}
+        case = {"options": {}, "environment": {"CUDA_DEVICE_MAX_CONNECTIONS": "32"}}
+        self.assertEqual(materialize_case(manifest, case)["environment"], case["environment"])
+        with self.assertRaises(ValueError):
+            materialize_case(manifest, case | {"environment": {"PYTHONPATH": "/another/checkout"}})
+
+    def test_named_parameter_references(self):
+        first, second = object(), object()
+        references = {id(first): {"parameter": "layer.0"}, id(second): {"parameter": "layer.1"}}
+        self.assertEqual(
+            encode({first: [second]}, references=references),
+            {"mapping": [[{"parameter": "layer.0"}, [{"parameter": "layer.1"}]]]},
+        )
+        self.assertTrue(differences(encode(first, references=references), encode(second, references=references)))
+        with self.assertRaises(TypeError):
+            encode(object(), references=references)
 
     def test_infinite_config_sentinel(self):
         self.assertEqual(encode(float("inf")), {"float": "+inf"})

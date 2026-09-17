@@ -32,6 +32,8 @@ Use node-local storage for builds, caches and temporary results. Set `HF_HOME`,
 `TORCH_EXTENSIONS_DIR`, `TRITON_CACHE_DIR`, `XDG_CACHE_HOME` and `TMPDIR` accordingly.
 The tokenizer fixture is created locally and offline. All logger cases use local
 TensorBoard only; external loggers and telemetry are disabled.
+For Hopper TP/CP cases, set `CUDA_DEVICE_MAX_CONNECTIONS=1`. The FSDP2 builder case
+explicitly overrides this to 32 for both child processes to satisfy MLM validation.
 
 Select additional cases by name from `cases.json`. Omit `--cases` only when enough
 GPUs are allocated for every case. Cases needing checkpoint arguments/resume first
@@ -46,7 +48,7 @@ at sequence length 32); the legacy ramp case preserves its existing deprecated b
 ## What is measured
 
 `capture_config_seams.py` runs the checkout's actual `pretrain_gpt.py` (or
-`pretrain_hybrid.py` for the two Hybrid builder cases) as `__main__`.
+`pretrain_hybrid.py` for Hybrid builder cases, or `pretrain_vlm.py` for the VLM case) as `__main__`.
 It observes its existing initialization path instead of recreating the old/new order.
 The same capture implementation is used for both revisions.
 
@@ -64,8 +66,10 @@ All dataclass fields are encoded recursively. Tokenizers use type/vocabulary/spe
 descriptors; callable names, defaults and closure values are retained. Bound methods
 record their function and owner type, not the owner's mutable runtime state. Timer
 services record logging settings, not elapsed wall-clock measurements. Unsupported
-objects fail explicitly. Source/fixture/run roots are replaced only at path boundaries;
-timing and provenance are not configuration values. Missing and null, tuples and lists,
+objects fail explicitly. Source/fixture/run roots are replaced only at path boundaries.
+DDP layout parameter references use model-local names, shapes, dtypes and trainability,
+not memory addresses or tensor values. Unregistered parameter references still fail.
+Timing and provenance are not configuration values. Missing and null, tuples and lists,
 integers and booleans remain distinct. No numeric tolerance or broad field ignore list.
 
 The nine planned surfaces are model TransformerConfig, OptimizerConfig, DDPConfig,
@@ -79,6 +83,8 @@ tests and training/resume/convergence/performance validation, not replaces them.
 
 See [the PR7418 results](RESULTS.md) for the first pinned main/head matrix and
 separate branch-point control, including the upstream differences found.
+See [scenario coverage](SCENARIOS.md) for the expanded recipe matrix, pinned source
+provenance, GPU requirements and limits of each testing tier.
 
 `report.json` records the exact revisions/trees, harness and fixture hashes, environment
 identifier, per-case outcome and field-level differences. Case subdirectories contain
@@ -93,6 +99,6 @@ adapters if APIs move, without reproducing production calculations. Add a named 
 case for new configuration semantics and required captures so omissions cannot silently
 pass. Self-tests deliberately change vocabulary/scheduler/DDP values and omit captures.
 
-Out of scope for this first harness: full convergence/performance CI, exhaustive model
-families, specialized VLM/RL/distillation configs, and TrainState-authority checks.
+Out of scope: full convergence/performance CI, exhaustive model families, real packed
+multimodal data pipelines, RL/distillation configs, and TrainState-authority checks.
 Do not commit raw run artifacts: they can contain private paths or environment metadata.
