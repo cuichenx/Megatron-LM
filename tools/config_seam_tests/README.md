@@ -77,6 +77,9 @@ tests and training/resume/convergence/performance validation, not replaces them.
 
 ## Results and extension
 
+See [the PR7418 results](RESULTS.md) for the first pinned main/head matrix and
+separate branch-point control, including the upstream differences found.
+
 `report.json` records the exact revisions/trees, harness and fixture hashes, environment
 identifier, per-case outcome and field-level differences. Case subdirectories contain
 expanded argv, per-rank snapshots and logs. A missing capture, timeout or failed baseline
