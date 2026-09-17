@@ -83,8 +83,8 @@ tests and training/resume/convergence/performance validation, not replaces them.
 
 ## Results and extension
 
-See [the PR7418 results](RESULTS.md) for the pinned before/after comparisons and
-historical main/head matrix, including the unrelated upstream differences found.
+See [the PR7418 results](RESULTS.md) for the current pinned before/after comparison.
+Earlier results remain available in Git history.
 See [scenario coverage](SCENARIOS.md) for the expanded recipe matrix, pinned source
 provenance, GPU requirements and limits of each testing tier.
 
