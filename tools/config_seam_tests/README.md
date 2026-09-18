@@ -19,8 +19,8 @@ uv run --no-sync python -m unittest -v test_snapshot
 uv run --no-sync python compare_config_seams.py \
   --baseline /path/to/main-worktree \
   --candidate /path/to/pr-worktree \
-  --baseline-revision cfa9e20d2658844dd84a07f2ccd34d7e62ab5552 \
-  --candidate-revision c92551aa6f63c64a5a495a94b784c19ad0966a8c \
+  --baseline-revision d564dd01de4549a4884be26b1d74e169798fd877 \
+  --candidate-revision f0148a3600818588406d8ca6437a8de1f8377f38 \
   --environment-id YOUR_CONTAINER_REFERENCE_OR_DIGEST \
   --output /path/to/new-result-directory \
   --cases defaults known_padded known_unpadded hf_derived hf_unpadded
