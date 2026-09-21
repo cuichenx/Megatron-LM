@@ -74,9 +74,12 @@ not memory addresses or tensor values. Unregistered parameter references still f
 Timing and provenance are not configuration values. Missing and null, tuples and lists,
 integers and booleans remain distinct. No numeric tolerance or broad field ignore list.
 
-The nine planned surfaces are model TransformerConfig, OptimizerConfig, DDPConfig,
+The configuration surfaces include model TransformerConfig, OptimizerConfig, DDPConfig,
 SchedulerConfig, OptimizerParamScheduler, CheckpointConfig, LoggerConfig, TokenizerConfig
-and GPTDatasetConfig. Checkpoint/logger configuration captures are not an exhaustive
+and GPTDatasetConfig, plus ProfilingConfig for the ownership pilot. Enabled profiling
+cases also observe real profiler-schedule and memory-snapshot calls. These captures
+work on both sides without reproducing production profiling calculations.
+Checkpoint/logger configuration captures are not an exhaustive
 audit of every downstream consumer. Constructor input equality does not prove complete
 model/process-group/control-flow equivalence. This harness supplements behavioral unit
 tests and training/resume/convergence/performance validation, not replaces them.

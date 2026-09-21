@@ -122,7 +122,17 @@ def main() -> None:
         def entry(cfg, dataset_provider, *args, **kwargs):
             cli = globals_.get_args()
             record("config.model", cfg.model)
-            for field in ("optimizer", "ddp", "scheduler", "checkpoint", "logger", "tokenizer", "train", "validation"):
+            for field in (
+                "optimizer",
+                "ddp",
+                "scheduler",
+                "checkpoint",
+                "logger",
+                "tokenizer",
+                "train",
+                "validation",
+                "profiling",
+            ):
                 record("config." + field, getattr(cfg, field))
             record(
                 "runtime.services",
@@ -170,6 +180,8 @@ def main() -> None:
         package.pretrain = entry
         training.pretrain = entry
         if case["tier"] == "runtime":
+            observe_call(torch.profiler, "schedule", "consumer.profiler_schedule")
+            observe_call(torch.cuda.memory, "_dump_snapshot", "consumer.memory_snapshot")
             observe_call(GPTModel, "__init__", "consumer.model", excluded=("self",))
             if entrypoint == "pretrain_vlm.py":
                 from megatron.core.models.multimodal.llava_model import LLaVAModel

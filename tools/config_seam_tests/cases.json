@@ -57,6 +57,7 @@
     "config.tokenizer",
     "config.train",
     "config.validation",
+    "config.profiling",
     "runtime.microbatch_inputs",
     "runtime.tokenizer_inputs",
     "runtime.tokenizer",
@@ -239,6 +240,52 @@
         "--save": "{run}/checkpoint",
         "--save-interval": "2",
         "--ckpt-format": "torch_dist"
+      }
+    },
+    {
+      "name": "profiling_disabled",
+      "tier": "runtime",
+      "options": {"--use-pytorch-profiler": true}
+    },
+    {
+      "name": "profiling_nsys",
+      "tier": "runtime",
+      "options": {
+        "--profile": true, "--profile-step-start": "1", "--profile-step-end": "3",
+        "--profile-ranks": "0", "--nvtx-ranges": true, "--record-shapes": true
+      }
+    },
+    {
+      "name": "profiling_pytorch",
+      "tier": "runtime",
+      "required": ["consumer.profiler_schedule"],
+      "options": {
+        "--profile": true, "--use-pytorch-profiler": true,
+        "--profile-step-start": "1", "--profile-step-end": "3",
+        "--pytorch-profiler-collect-shapes": true, "--pytorch-profiler-collect-callstack": true,
+        "--tensorboard-dir": "{run}/tensorboard"
+      }
+    },
+    {
+      "name": "profiling_memory",
+      "tier": "runtime",
+      "required": ["consumer.memory_snapshot"],
+      "options": {
+        "--record-memory-history": true, "--profile-ranks": "0",
+        "--memory-snapshot-path": "{run}/memory.pickle"
+      }
+    },
+    {
+      "name": "profiling_resume",
+      "tier": "runtime",
+      "needs_checkpoint": true,
+      "required": ["consumer.profiler_schedule"],
+      "options": {
+        "--load": "{checkpoint}", "--use-checkpoint-args": true,
+        "--exit-on-missing-checkpoint": true,
+        "--profile": true, "--use-pytorch-profiler": true,
+        "--profile-step-start": "3", "--profile-step-end": "4",
+        "--tensorboard-dir": "{run}/tensorboard"
       }
     },
     {
