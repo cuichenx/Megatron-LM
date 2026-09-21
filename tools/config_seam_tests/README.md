@@ -2,7 +2,8 @@
 
 This fork-only harness supports section 1.1 testing items 1–2: compare configuration
 objects and resolved inputs across a representative CLI matrix. It is **not part of
-PR7418**, does not modify either tested checkout, and does not need to land in MLM main.
+PR7418 or the profiling ownership PR**, does not modify either tested checkout,
+and does not need to land in MLM main.
 
 ## Run
 
@@ -49,6 +50,17 @@ at sequence length 32); the legacy ramp case preserves its existing deprecated b
 
 ## What is measured
 
+For the profiling ownership pilot, use the same command above with the chosen pinned
+baseline/candidate revisions and select these one-GPU runtime cases:
+
+```bash
+--cases runtime_fresh runtime_resume profiling_disabled profiling_excluded_rank \
+  profiling_nsys profiling_pytorch profiling_memory profiling_resume
+```
+
+Use the exact #7418 parent to isolate C01, and the frozen main ancestor for the
+cumulative comparison. Neither comparison requires a different capture implementation.
+
 `capture_config_seams.py` runs the checkout's actual `pretrain_gpt.py` (or
 `pretrain_hybrid.py` for Hybrid builder cases, or `pretrain_vlm.py` for the VLM case) as `__main__`.
 It observes its existing initialization path instead of recreating the old/new order.
@@ -87,6 +99,7 @@ tests and training/resume/convergence/performance validation, not replaces them.
 ## Results and extension
 
 See [the PR7418 results](RESULTS.md) for the current pinned before/after comparison.
+See [the profiling ownership results](PROFILING_RESULTS.md) for the separate C01 pilot.
 Earlier results remain available in Git history.
 See [scenario coverage](SCENARIOS.md) for the expanded recipe matrix, pinned source
 provenance, GPU requirements and limits of each testing tier.
