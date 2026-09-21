@@ -256,6 +256,14 @@
       }
     },
     {
+      "name": "profiling_excluded_rank",
+      "tier": "runtime",
+      "options": {
+        "--profile": true, "--use-pytorch-profiler": true,
+        "--profile-ranks": "1", "--profile-step-start": "2", "--profile-step-end": "2"
+      }
+    },
+    {
       "name": "profiling_pytorch",
       "tier": "runtime",
       "required": ["consumer.profiler_schedule"],

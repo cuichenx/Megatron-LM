@@ -1,7 +1,7 @@
 # Scenario coverage and recipe provenance
 
-The matrix contains 43 cases: the original 19 initialization/configuration cases,
-19 recipe-inspired additions below, and five profiling ownership cases. These are small, offline configuration-seam tests,
+The matrix contains 44 cases: the original 19 initialization/configuration cases,
+19 recipe-inspired additions below, and six profiling ownership cases. These are small, offline configuration-seam tests,
 not reproductions of production model quality or throughput. Keep the feature
 combinations while reducing layers, hidden sizes, experts, sequence length and steps.
 
@@ -73,14 +73,16 @@ Mock multimodal training is not a validation of a real packed SFT data pipeline.
 
 ## Profiling ownership pilot
 
-Five additional one-GPU runtime cases exercise the existing MLM profiler modes:
+Six additional one-GPU runtime cases exercise the existing MLM profiler modes:
 `profiling_disabled` (PyTorch option without `--profile`), `profiling_nsys`
 (CUDA-profiler window, NVTX, shape recording), `profiling_pytorch` (shape/callstack
 collection and trace export), `profiling_memory` (memory-history snapshots), and
 `profiling_resume` (current-run profiling policy after loading the shared baseline checkpoint).
+`profiling_excluded_rank` preserves the accepted no-op behavior when no launched rank
+is selected, even if the unused PyTorch window would be invalid on a selected rank.
 All captures include `ProfilingConfig`; the enabled PyTorch and memory cases also
 require actual schedule or snapshot-call captures. CUDA-profiler API execution is
-tested without an external Nsight capture. Chakra, nonselected-rank behavior and
+tested without an external Nsight capture. Chakra and
 deliberately removed/divergent legacy args are covered by targeted product unit tests,
 not these one-rank comparison cases. Case presence is not a validation result.
 
