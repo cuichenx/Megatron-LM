@@ -58,8 +58,8 @@ baseline/candidate revisions and select these one-GPU runtime cases:
   profiling_nsys profiling_pytorch profiling_memory profiling_resume
 ```
 
-Use the exact #7418 parent to isolate C01, and the frozen main ancestor for the
-cumulative comparison. Neither comparison requires a different capture implementation.
+Use the frozen main baseline and candidate recorded in [the profiling results](PROFILING_RESULTS.md).
+That baseline already includes merged #7418; keep it fixed throughout the comparison.
 
 For logging ownership, select `runtime_fresh runtime_resume logging_metrics
 logging_attention logging_resume`. The added one-GPU cases exercise local
