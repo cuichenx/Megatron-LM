@@ -15,6 +15,37 @@ def qualified_name(value: Any) -> str:
     return f"{value.__module__}.{value.__qualname__}"
 
 
+LEGACY_LOGGER_FIELDS = (
+    "enable_one_logger",
+    "one_logger_project",
+    "one_logger_run_name",
+    "one_logger_async",
+    "app_tag_run_name",
+    "app_tag_run_version",
+    "otel_enabled",
+    "otel_service_name",
+    "otel_span_groups",
+    "run_workload_inspector_server",
+)
+
+
+def logger_settings(config: Any, args: Any) -> dict:
+    """Observe actual logging owners across the CLI-to-config schema migration.
+
+    Keep every dataclass field. Only the ten historically CLI-only fields may
+    come from args, and only when absent from the dataclass schema. Missing
+    legacy input fails; a missing native value is never repaired from args.
+    This selects existing values without normalizing or inventing defaults.
+    """
+    values = {
+        field.name: getattr(config, field.name, {"missing_attribute": True}) for field in dataclasses.fields(config)
+    }
+    for name in LEGACY_LOGGER_FIELDS:
+        if name not in values:
+            values[name] = getattr(args, name)
+    return {"type": qualified_name(type(config)), "fields": values}
+
+
 def encode(value: Any, roots: dict[str, str] | None = None, references: dict[int, dict] | None = None) -> Any:
     """Encode supported semantic values; reject unsupported objects, never use repr."""
     roots = roots or {}

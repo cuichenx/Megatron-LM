@@ -61,6 +61,18 @@ baseline/candidate revisions and select these one-GPU runtime cases:
 Use the exact #7418 parent to isolate C01, and the frozen main ancestor for the
 cumulative comparison. Neither comparison requires a different capture implementation.
 
+For logging ownership, select `runtime_fresh runtime_resume logging_metrics
+logging_attention logging_resume`. The added one-GPU cases exercise local
+TensorBoard/timer construction, parameter/gradient metrics, throughput/memory
+logging, max-attention-logit instrumentation, save and current-run settings on
+resume. They observe real writer/timer constructor inputs, not nondeterministic
+elapsed times or GPU-memory measurements. External W&B/one-logger/OTel services
+remain disabled and need separate behavioral tests with controlled service doubles.
+The resume case disables level-1 timing barriers for the current run, while the
+metrics case retains the default enabled policy. Inspector startup is covered by
+controlled behavioral tests rather than opening a network listener in this suite.
+These cases are available but are not validated by the older published results.
+
 `capture_config_seams.py` runs the checkout's actual `pretrain_gpt.py` (or
 `pretrain_hybrid.py` for Hybrid builder cases, or `pretrain_vlm.py` for the VLM case) as `__main__`.
 It observes its existing initialization path instead of recreating the old/new order.
@@ -85,6 +97,17 @@ DDP layout parameter references use model-local names, shapes, dtypes and traina
 not memory addresses or tensor values. Unregistered parameter references still fail.
 Timing and provenance are not configuration values. Missing and null, tuples and lists,
 integers and booleans remain distinct. No numeric tolerance or broad field ignore list.
+
+For the logging ownership migration, `config.logger` retains every native field
+and additionally observes ten formerly CLI-only one-logger/OTel/inspector settings from
+their actual legacy owner. Once a field exists in the dataclass schema, its native
+value is authoritative, including null; stale CLI values cannot replace it.
+Missing legacy inputs fail rather than receiving invented defaults. The raw native
+field list is recorded separately as `logger_schema_fields` provenance, making the
+schema expansion visible without treating a changed storage location as a changed
+setting. This observation adapter does not reproduce production normalization or
+exclude unknown/new fields. Self-tests exercise changed values, missing inputs,
+native nulls and future fields.
 
 The configuration surfaces include model TransformerConfig, OptimizerConfig, DDPConfig,
 SchedulerConfig, OptimizerParamScheduler, CheckpointConfig, LoggerConfig, TokenizerConfig

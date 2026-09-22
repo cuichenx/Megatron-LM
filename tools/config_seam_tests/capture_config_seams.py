@@ -13,7 +13,7 @@ import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
-from snapshot import encode
+from snapshot import encode, logger_settings
 
 
 def main() -> None:
@@ -133,7 +133,11 @@ def main() -> None:
                 "validation",
                 "profiling",
             ):
-                record("config." + field, getattr(cfg, field))
+                value = getattr(cfg, field)
+                if field == "logger":
+                    result["logger_schema_fields"] = [field.name for field in dataclasses.fields(value)]
+                    value = logger_settings(value, cli)
+                record("config." + field, value)
             record(
                 "runtime.services",
                 {
@@ -180,6 +184,10 @@ def main() -> None:
         package.pretrain = entry
         training.pretrain = entry
         if case["tier"] == "runtime":
+            from torch.utils.tensorboard import SummaryWriter
+
+            observe_call(SummaryWriter, "__init__", "consumer.tensorboard", excluded=("self",))
+            observe_call(globals_.Timers, "__init__", "consumer.timers", excluded=("self",))
             observe_call(torch.profiler, "schedule", "consumer.profiler_schedule")
             observe_call(torch.cuda.memory, "_dump_snapshot", "consumer.memory_snapshot")
             observe_call(GPTModel, "__init__", "consumer.model", excluded=("self",))

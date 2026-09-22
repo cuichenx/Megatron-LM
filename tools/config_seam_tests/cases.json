@@ -229,6 +229,46 @@
       }
     },
     {
+      "name": "logging_metrics",
+      "tier": "runtime",
+      "required": ["consumer.tensorboard", "consumer.timers", "runtime.checkpoint_save"],
+      "options": {
+        "--tensorboard-dir": "{run}/tensorboard", "--tensorboard-queue-size": "5",
+        "--tensorboard-log-interval": "2", "--log-interval": "2",
+        "--timing-log-level": "2", "--timing-log-option": "all",
+        "--log-timers-to-tensorboard": true, "--log-params-norm": true,
+        "--log-num-zeros-in-grad": true,
+        "--log-throughput": true,
+        "--log-memory-to-tensorboard": true, "--log-memory-interval": "2",
+        "--log-validation-ppl-to-tensorboard": true, "--log-world-size-to-tensorboard": true,
+        "--save": "{run}/checkpoint", "--save-interval": "2",
+        "--exit-interval": "2", "--ckpt-format": "torch_dist"
+      }
+    },
+    {
+      "name": "logging_attention",
+      "tier": "runtime",
+      "required": ["consumer.tensorboard", "consumer.timers"],
+      "options": {
+        "--tensorboard-dir": "{run}/tensorboard", "--log-max-attention-logit": true,
+        "--exit-interval": "2"
+      }
+    },
+    {
+      "name": "logging_resume",
+      "tier": "runtime",
+      "needs_checkpoint": true,
+      "required": ["consumer.tensorboard", "consumer.timers", "runtime.checkpoint_load"],
+      "options": {
+        "--load": "{checkpoint}", "--use-checkpoint-args": true,
+        "--exit-on-missing-checkpoint": true, "--tensorboard-dir": "{run}/tensorboard",
+        "--tensorboard-queue-size": "7", "--log-interval": "2",
+        "--log-params-norm": true, "--log-num-zeros-in-grad": true,
+        "--log-validation-ppl-to-tensorboard": true, "--timing-log-level": "1",
+        "--no-barrier-with-level-1-timing": true
+      }
+    },
+    {
       "name": "runtime_tp2_pp2_dp2",
       "tier": "runtime",
       "ranks": 8,

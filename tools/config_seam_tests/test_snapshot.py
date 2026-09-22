@@ -4,10 +4,12 @@
 import copy
 import json
 import unittest
+from dataclasses import make_dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 from compare_config_seams import compare_runs, materialize_case, validate
-from snapshot import differences, encode
+from snapshot import LEGACY_LOGGER_FIELDS, differences, encode, logger_settings
 
 
 class SnapshotTests(unittest.TestCase):
@@ -15,6 +17,31 @@ class SnapshotTests(unittest.TestCase):
 
     def test_equal(self):
         self.assertEqual(differences(encode({"vocab": 256}), encode({"vocab": 256})), [])
+
+    def test_logger_owner_migration_is_exact(self):
+        legacy = make_dataclass("LoggerConfig", [("log_interval", int)], namespace={"__module__": "fixture"})
+        native = make_dataclass(
+            "LoggerConfig",
+            [("log_interval", int), *((name, object) for name in LEGACY_LOGGER_FIELDS)],
+            namespace={"__module__": "fixture"},
+        )
+        args = SimpleNamespace(**{name: index for index, name in enumerate(LEGACY_LOGGER_FIELDS)})
+        expected = encode(logger_settings(legacy(7), args))
+        config = native(7, **vars(args))
+        self.assertEqual(differences(expected, encode(logger_settings(config, SimpleNamespace()))), [])
+        config.one_logger_project = "changed"
+        self.assertTrue(differences(expected, encode(logger_settings(config, args))))
+        config.one_logger_project = None
+        self.assertIsNone(logger_settings(config, args)["fields"]["one_logger_project"])
+        del config.one_logger_project
+        self.assertEqual(logger_settings(config, args)["fields"]["one_logger_project"], {"missing_attribute": True})
+        with self.assertRaises(AttributeError):
+            logger_settings(legacy(7), SimpleNamespace())
+
+    def test_logger_projection_retains_unknown_fields(self):
+        schema = make_dataclass("LoggerConfig", [("future_setting", int)])
+        args = SimpleNamespace(**dict.fromkeys(LEGACY_LOGGER_FIELDS))
+        self.assertTrue(differences(logger_settings(schema(1), args), logger_settings(schema(2), args)))
 
     def test_changed_values(self):
         for name in ("vocab_size", "lr_decay_steps", "bucket_size"):
