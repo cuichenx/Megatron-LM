@@ -71,7 +71,8 @@ remain disabled and need separate behavioral tests with controlled service doubl
 The resume case disables level-1 timing barriers for the current run, while the
 metrics case retains the default enabled policy. Inspector startup is covered by
 controlled behavioral tests rather than opening a network listener in this suite.
-These cases are available but are not validated by the older published results.
+See [the LoggerConfig report](LOGGER_RESULTS.md) for the pinned five-case result;
+the older profiling and initialization reports do not validate these changes.
 
 `capture_config_seams.py` runs the checkout's actual `pretrain_gpt.py` (or
 `pretrain_hybrid.py` for Hybrid builder cases, or `pretrain_vlm.py` for the VLM case) as `__main__`.
