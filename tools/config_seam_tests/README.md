@@ -87,6 +87,7 @@ also require RNG observations at checkpoint save and after load. Each resume
 case uses its specified baseline seed scenario; the DP cases share a two-rank
 baseline checkpoint with data-parallel random initialization enabled.
 These comparisons supplement the product's native/deleted-args ownership tests.
+See [the RNGConfig report](RNG_RESULTS.md) for pinned validation results.
 
 `capture_config_seams.py` runs the checkout's actual `pretrain_gpt.py` (or
 `pretrain_hybrid.py` for Hybrid builder cases, or `pretrain_vlm.py` for the VLM case) as `__main__`.
