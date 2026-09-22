@@ -2,7 +2,7 @@
 
 This fork-only harness supports section 1.1 testing items 1–2: compare configuration
 objects and resolved inputs across a representative CLI matrix. It is **not part of
-PR7418 or the profiling ownership PR**, does not modify either tested checkout,
+PR7418 or the config-ownership PRs**, does not modify either tested checkout,
 and does not need to land in MLM main.
 
 ## Run
@@ -74,6 +74,20 @@ controlled behavioral tests rather than opening a network listener in this suite
 See [the LoggerConfig report](LOGGER_RESULTS.md) for the pinned five-case result;
 the older profiling and initialization reports do not validate these changes.
 
+For RNG ownership, run these one-GPU cases:
+
+```bash
+--cases runtime_fresh runtime_resume rng_custom_seed rng_te_tracker rng_inference_tracker
+```
+
+Run `rng_dp_fresh rng_dp_resume` separately with two GPUs. Every runtime case
+captures the actual seeding inputs and exact Python/NumPy RNG states plus hashes
+of CPU/CUDA/tracker state, without drawing random values. Save and resume cases
+also require RNG observations at checkpoint save and after load. Each resume
+case uses its specified baseline seed scenario; the DP cases share a two-rank
+baseline checkpoint with data-parallel random initialization enabled.
+These comparisons supplement the product's native/deleted-args ownership tests.
+
 `capture_config_seams.py` runs the checkout's actual `pretrain_gpt.py` (or
 `pretrain_hybrid.py` for Hybrid builder cases, or `pretrain_vlm.py` for the VLM case) as `__main__`.
 It observes its existing initialization path instead of recreating the old/new order.
@@ -112,7 +126,7 @@ native nulls and future fields.
 
 The configuration surfaces include model TransformerConfig, OptimizerConfig, DDPConfig,
 SchedulerConfig, OptimizerParamScheduler, CheckpointConfig, LoggerConfig, TokenizerConfig
-and GPTDatasetConfig, plus ProfilingConfig for the ownership pilot. Enabled profiling
+and GPTDatasetConfig, plus ProfilingConfig and RNGConfig. Enabled profiling
 cases also observe real profiler-schedule and memory-snapshot calls. These captures
 work on both sides without reproducing production profiling calculations.
 Checkpoint/logger configuration captures are not an exhaustive

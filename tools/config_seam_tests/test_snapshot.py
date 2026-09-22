@@ -2,6 +2,7 @@
 """CPU-only harness self-checks, independent of MLM's GPU pytest fixtures."""
 
 import copy
+import functools
 import json
 import unittest
 from dataclasses import make_dataclass
@@ -9,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from compare_config_seams import compare_runs, materialize_case, validate
+from capture_config_seams import build_dataset_config
 from snapshot import LEGACY_LOGGER_FIELDS, differences, encode, logger_settings
 
 
@@ -17,6 +19,29 @@ class SnapshotTests(unittest.TestCase):
 
     def test_equal(self):
         self.assertEqual(differences(encode({"vocab": 256}), encode({"vocab": 256})), [])
+
+    def test_dataset_callback_owner_binding(self):
+        for owned in (False, True):
+            namespace = {}
+            factory = "def core_gpt_dataset_config_from_args(args, *, random_seed): return random_seed" if owned else "def core_gpt_dataset_config_from_args(args): return args.seed"
+            exec(factory + "\ndef provider(*, random_seed=None): pass", namespace)
+            provider = namespace["provider"]
+            if owned:
+                with self.assertRaises(ValueError):
+                    build_dataset_config(provider, SimpleNamespace(seed=7))
+                provider = functools.update_wrapper(functools.partial(provider, random_seed=9), provider)
+            self.assertEqual(build_dataset_config(provider, SimpleNamespace(seed=7)), 9 if owned else 7)
+
+    def test_checkpoint_seed_scenarios_are_self_contained(self):
+        manifest = json.loads(Path(__file__).with_name("cases.json").read_text())
+        by_name = {case["name"]: case for case in manifest["cases"]}
+        for case in by_name.values():
+            if case.get("needs_checkpoint"):
+                seed = by_name[case.get("checkpoint_seed_case", "runtime_fresh")]
+                self.assertEqual(seed["tier"], "runtime")
+                self.assertFalse(seed.get("needs_checkpoint"))
+                self.assertIn("--save", seed["options"])
+        self.assertEqual(by_name["rng_dp_resume"]["checkpoint_seed_case"], "rng_dp_fresh")
 
     def test_logger_owner_migration_is_exact(self):
         legacy = make_dataclass("LoggerConfig", [("log_interval", int)], namespace={"__module__": "fixture"})

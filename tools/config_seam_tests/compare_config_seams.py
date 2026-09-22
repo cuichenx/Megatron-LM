@@ -216,18 +216,23 @@ def main() -> None:
         for p in fixtures.rglob("*")
         if p.is_file()
     }
-    checkpoint = options.output / "seed" / "run" / "checkpoint"
-    report = {"schema": 1, "provenance": provenance, "results": []}
-    if any(case.get("needs_checkpoint") for case in cases):
-        seed = materialize_case(manifest, next(case for case in manifest["cases"] if case["name"] == "runtime_fresh"))
+    report = {"schema": 1, "provenance": provenance, "results": [], "checkpoint_seeds": {}}
+    seed_names = sorted({case.get("checkpoint_seed_case", "runtime_fresh") for case in cases if case.get("needs_checkpoint")})
+    for seed_name in seed_names:
+        seed_case = next((case for case in manifest["cases"] if case["name"] == seed_name), None)
+        if seed_case is None or seed_case["tier"] != "runtime" or seed_case.get("needs_checkpoint"):
+            parser.error("Checkpoint seed must name a fresh runtime case")
+        seed = materialize_case(manifest, seed_case)
+        seed_root = options.output / "seed" / seed_name
+        checkpoint = seed_root / "run" / "checkpoint"
         seed["name"] = "checkpoint_seed"
-        run = run_case(options.baseline, seed, options.output / "seed", fixtures, checkpoint, options.timeout)
+        run = run_case(options.baseline, seed, seed_root, fixtures, checkpoint, options.timeout)
         seed_errors = [
             item
             for snapshot in run["snapshots"]
             for item in validate(snapshot, [*manifest["required"], "runtime.checkpoint_save"])
         ]
-        report["checkpoint_seed"] = {
+        report["checkpoint_seeds"][seed_name] = {
             "exit": run["exit"],
             "errors": seed_errors,
             "created": (checkpoint / "latest_checkpointed_iteration.txt").exists(),
@@ -238,10 +243,13 @@ def main() -> None:
             },
         }
     for case in cases:
+        seed_name = case.get("checkpoint_seed_case", "runtime_fresh")
+        checkpoint = options.output / "seed" / seed_name / "run" / "checkpoint"
+        seed_result = report["checkpoint_seeds"].get(seed_name)
         if case.get("needs_checkpoint") and (
-            report["checkpoint_seed"]["exit"] != 0
-            or report["checkpoint_seed"]["errors"]
-            or not report["checkpoint_seed"]["created"]
+            seed_result["exit"] != 0
+            or seed_result["errors"]
+            or not seed_result["created"]
         ):
             report["results"].append({"case": case["name"], "status": "missing_fixture"})
         else:
@@ -258,11 +266,11 @@ def main() -> None:
             }
             required = [*manifest["required"], *case.get("required", [])]
             if case["tier"] == "runtime":
-                required += ["consumer.model", "consumer.ddp", "consumer.optimizer"]
+                required += ["consumer.model", "consumer.ddp", "consumer.optimizer", "consumer.rng_seed", "runtime.rng_after_seed"]
                 if "--save" in case["argv"]:
-                    required += ["runtime.checkpoint_save"]
+                    required += ["runtime.checkpoint_save", "runtime.rng_at_save"]
                 if case.get("needs_checkpoint"):
-                    required += ["runtime.checkpoint_load"]
+                    required += ["runtime.checkpoint_load", "runtime.rng_after_load"]
             else:
                 required += ["builder.scheduler_points", "builder.batch_points"]
             report["results"].append(compare_runs(case, runs["baseline"], runs["candidate"], required))

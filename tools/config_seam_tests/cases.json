@@ -58,6 +58,7 @@
     "config.train",
     "config.validation",
     "config.profiling",
+    "config.rng",
     "runtime.microbatch_inputs",
     "runtime.tokenizer_inputs",
     "runtime.tokenizer",
@@ -67,6 +68,42 @@
     "consumer.scheduler"
   ],
   "cases": [
+    {
+      "name": "rng_custom_seed",
+      "tier": "runtime",
+      "options": {"--seed": "987", "--train-iters": "2", "--eval-iters": "0"}
+    },
+    {
+      "name": "rng_te_tracker",
+      "tier": "runtime",
+      "options": {"--te-rng-tracker": true, "--train-iters": "2", "--eval-iters": "0"}
+    },
+    {
+      "name": "rng_inference_tracker",
+      "tier": "runtime",
+      "options": {"--inference-rng-tracker": true, "--train-iters": "2", "--eval-iters": "0"}
+    },
+    {
+      "name": "rng_dp_fresh",
+      "tier": "runtime",
+      "ranks": 2,
+      "options": {
+        "--data-parallel-random-init": true, "--seed": "789",
+        "--save": "{run}/checkpoint", "--save-interval": "2", "--exit-interval": "2",
+        "--ckpt-format": "torch_dist"
+      }
+    },
+    {
+      "name": "rng_dp_resume",
+      "tier": "runtime",
+      "ranks": 2,
+      "needs_checkpoint": true,
+      "checkpoint_seed_case": "rng_dp_fresh",
+      "options": {
+        "--data-parallel-random-init": true, "--seed": "789", "--load": "{checkpoint}",
+        "--use-checkpoint-args": true, "--exit-on-missing-checkpoint": true
+      }
+    },
     {
       "name": "hybrid_known",
       "entrypoint": "pretrain_hybrid.py",

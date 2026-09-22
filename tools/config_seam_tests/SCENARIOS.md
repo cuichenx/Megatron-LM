@@ -1,7 +1,8 @@
 # Scenario coverage and recipe provenance
 
-The matrix contains 44 cases: the original 19 initialization/configuration cases,
-19 recipe-inspired additions below, and six profiling ownership cases. These are small, offline configuration-seam tests,
+The matrix contains 52 cases: the original 19 initialization/configuration cases,
+19 recipe-inspired additions below, six profiling, three logging, and five RNG
+ownership cases. These are small, offline configuration-seam tests,
 not reproductions of production model quality or throughput. Keep the feature
 combinations while reducing layers, hidden sizes, experts, sequence length and steps.
 
@@ -85,6 +86,16 @@ require actual schedule or snapshot-call captures. CUDA-profiler API execution i
 tested without an external Nsight capture. Chakra and
 deliberately removed/divergent legacy args are covered by targeted product unit tests,
 not these one-rank comparison cases. Case presence is not a validation result.
+
+## RNG ownership
+
+`rng_custom_seed`, `rng_te_tracker`, and `rng_inference_tracker` use one GPU
+to exercise nondefault seeding and each optional tracker. `rng_dp_fresh` and
+`rng_dp_resume` use two GPUs and data-parallel random initialization, including
+rank-specific checkpoint RNG restore. The latter explicitly selects the former
+as its baseline checkpoint seed scenario. All runtime cases capture exact RNG
+state after seeding and at relevant save/load boundaries. No random draws are
+added by the observer. Case presence is not a validation result.
 
 ## Deliberately separate follow-up coverage
 

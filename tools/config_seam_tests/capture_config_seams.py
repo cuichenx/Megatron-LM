@@ -4,6 +4,7 @@
 import argparse
 import dataclasses
 import functools
+import hashlib
 import inspect
 import json
 import os
@@ -14,6 +15,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from snapshot import encode, logger_settings
+
+
+def build_dataset_config(dataset_provider, args):
+    """Call the observed checkout's factory through either callback signature."""
+    factory = inspect.unwrap(dataset_provider).__globals__["core_gpt_dataset_config_from_args"]
+    inputs = {}
+    if "random_seed" in inspect.signature(factory).parameters:
+        if not isinstance(dataset_provider, functools.partial) or "random_seed" not in dataset_provider.keywords:
+            raise ValueError("Dataset callback is missing its explicit random_seed binding")
+        inputs["random_seed"] = dataset_provider.keywords["random_seed"]
+    return factory(args, **inputs)
 
 
 def main() -> None:
@@ -132,6 +144,7 @@ def main() -> None:
                 "train",
                 "validation",
                 "profiling",
+                "rng",
             ):
                 value = getattr(cfg, field)
                 if field == "logger":
@@ -162,7 +175,7 @@ def main() -> None:
                 return original_pretrain(cfg, dataset_provider, *args, **kwargs)
             # Builder tier: execute the real dataset builder and scheduler derivation,
             # but do NOT claim model/optimizer/DDP construction or checkpoint I/O.
-            dataset_provider.__globals__["core_gpt_dataset_config_from_args"](cli)
+            build_dataset_config(dataset_provider, cli)
             optimizer = SimpleNamespace(param_groups=[{"default_config": True}, {"wd_mult": 0.0}])
             scheduler = training.get_optimizer_param_scheduler(optimizer)
             for target in sorted(
@@ -185,7 +198,32 @@ def main() -> None:
         training.pretrain = entry
         if case["tier"] == "runtime":
             from torch.utils.tensorboard import SummaryWriter
+            from megatron.training import initialize
+            from megatron.core import tensor_parallel
+            import numpy as np
+            import random
 
+            def rng_snapshot():
+                def tensor_digest(state):
+                    state = tensor_parallel.convert_cuda_rng_state(state, to_graphable=False)
+                    return hashlib.sha256(state.cpu().numpy().tobytes()).hexdigest()
+
+                numpy_state = np.random.get_state()
+                return {
+                    "python": random.getstate(),
+                    "numpy": (numpy_state[0], numpy_state[1].tolist(), *numpy_state[2:]),
+                    "cpu": tensor_digest(torch.get_rng_state()),
+                    "cuda": tensor_digest(torch.cuda.get_rng_state()),
+                    "trackers": {
+                        name: tensor_digest(state)
+                        for name, state in tensor_parallel.get_cuda_rng_tracker().get_states().items()
+                    },
+                }
+
+            observe_call(
+                initialize, "_set_random_seed", "consumer.rng_seed",
+                after=lambda args, output: record("runtime.rng_after_seed", rng_snapshot()),
+            )
             observe_call(SummaryWriter, "__init__", "consumer.tensorboard", excluded=("self",))
             observe_call(globals_.Timers, "__init__", "consumer.timers", excluded=("self",))
             observe_call(torch.profiler, "schedule", "consumer.profiler_schedule")
@@ -202,6 +240,7 @@ def main() -> None:
 
             @functools.wraps(original_save)
             def save(*args, **kwargs):
+                record("runtime.rng_at_save", rng_snapshot())
                 output = original_save(*args, **kwargs)
                 record("runtime.checkpoint_save", {"iteration": args[0], "completed": True})
                 return output
@@ -213,6 +252,7 @@ def main() -> None:
             def load(*args, **kwargs):
                 output = original_load(*args, **kwargs)
                 record("runtime.checkpoint_load", output)
+                record("runtime.rng_after_load", rng_snapshot())
                 return output
 
             training.load_checkpoint = load
