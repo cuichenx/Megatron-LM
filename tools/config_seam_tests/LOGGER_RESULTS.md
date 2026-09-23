@@ -8,12 +8,13 @@ and zero execution/capture errors.
 | Role | Revision |
 | --- | --- |
 | Frozen main baseline (merged #7418) | `5e85e2b27fc29bcf938e8f3b38acfbdecffcc8f3` |
-| LoggerConfig candidate ([draft #7587](https://github.com/NVIDIA/Megatron-LM/pull/7587)) | `48e29aa871fdb9fd80d07d5083d15e316d56e826` |
-| Fork-only harness code and manifest | `97758a57b0da28f0583f66c9ff7f625d33cbbe7b` |
+| LoggerConfig candidate ([draft #7587](https://github.com/NVIDIA/Megatron-LM/pull/7587)) | `6403261a35e3807349de5f77bf1cedf54adb9f15` |
+| Fork-only harness code and manifest | `40738bfed9b80a774eedeee4c1b0cd7e5ba716a4` |
 
 One H100, `nvcr.io/nvidian/nemo:26.10.rc0`, identical harness and fixture hashes,
 and a shared checkpoint produced by the baseline. Main was not advanced between
-runs. All 15 harness self-tests pass.
+runs. All 17 harness self-tests pass. Runtime and unit tests used this exact
+candidate commit, with the global run-config access pattern and original APIs.
 
 | Case | Result |
 | --- | --- |
@@ -31,12 +32,13 @@ match exactly wherever emitted. Metrics has 24 exact scalar trajectories and 12
 timing/throughput differences; attention has 13/13 exact and resume 18/18 exact.
 Elapsed-time and throughput measurements are not equality targets.
 
-Targeted units: candidate **331 passed**, baseline **285 passed**, three identical
-skips each, no errors/failures. All 46 ownership cases ran, including native config
+Targeted units: candidate **340 passed**, baseline **295 passed**, three identical
+skips each, no errors/failures. All 43 ownership cases ran, including native config
 values diverging from or replacing legacy args, detached metadata, service inputs,
-model/optimizer derivation, nested MIMO configs, teacher-YAML precedence and optional
-inspector startup. The final candidate differs from the unit-tested source only by
-wrapping changed calls and one docstring; executable AST equivalence was verified.
+model/optimizer derivation, nested MIMO configs and teacher-YAML precedence.
+Existing lifecycle coverage also checks sparse legacy initialization inputs and
+explicit CLI aliases. Helper-only inspector tests were removed with the unnecessary
+startup abstraction; the original inline lifecycle is retained.
 
 ## Reproduce and interpret
 
@@ -45,11 +47,12 @@ five cases. The comparison harness stays in this fork, outside the product PR.
 Its semantic observation adapter is not proof of ownership by itself; the separate
 native/divergent-args behavioral tests provide that gate.
 
-The manifest has 47 available cases; this report covers five, not a full rerun.
+The manifest has 52 available cases; this report covers five, not a full rerun.
 This validates short training/save/resume and captured configuration/consumer
 inputs, not full tensor equality, convergence, performance, multirank execution
-or every supported entrypoint. External telemetry services and workload-inspector
-startup have controlled unit coverage, not live network integration coverage.
+or every supported entrypoint. External telemetry service inputs have controlled
+unit coverage, not live network integration coverage; workload-inspector startup
+was not exercised in this runtime selection.
 
 Independent product and harness reviews found no remaining blocking findings.
 Baseline formatting/Pylint findings remain separate. Raw artifacts and private
