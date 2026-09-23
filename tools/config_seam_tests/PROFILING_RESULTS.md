@@ -1,6 +1,45 @@
 # ProfilingConfig ownership comparison
 
-## Current result — 2026-09-22
+## Original 38-case regression suite — 2026-09-22
+
+**All 38 cases have the expected result: 37 exact passes and one expected CLI
+rejection. Zero captured configuration differences or execution/capture errors.**
+
+| Role | Revision |
+| --- | --- |
+| Tested PR7568 candidate | `edc8f67b2ae1e8f1469267a904d1208b6c250bfd` |
+| Baseline: frozen main, including merged PR7418 | `5e85e2b27fc29bcf938e8f3b38acfbdecffcc8f3` |
+| Harness checkout | `ccd2f9dd80bbe1b8b742ee9560438c3bcd21d1b7` |
+| Harness code and manifest | `40738bfed9b80a774eedeee4c1b0cd7e5ba716a4` |
+
+The original 38 case definitions are unchanged from manifest revision
+`0ee5866bee35f2fb78d4368ab02466ae1c3f6485`; the six profiling, three logging,
+and five RNG additions were not selected for this run. Both sides used the same
+current harness, fixture hashes, and `nvcr.io/nvidian/nemo:26.10.rc0` environment.
+
+| Allocation | Cases | Result |
+| --- | --- | --- |
+| One H100 | 33 | 32 exact passes; one expected CLI rejection |
+| Two H100s | 4 | MoE EP2, CP2, TP2/sequence-parallel overlap, interleaved PP2/VPP2: all exact passes |
+| Eight H100s | 1 | TP2/PP2/DP2: exact pass |
+
+The 37 positive cases comprise 27 builder checks and ten short runtime checks,
+including fresh training/save, resume, full recompute, fine-tuning, and frozen-vision
+VLM. Builder checks do not construct the model/DDP/optimizer or execute training.
+`invalid_batch_conflict` is the expected rejection: both sides reject simultaneous
+`--global-batch-size` and `--step-batch-size-schedule` with the existing validation
+error. This is a passing negative test, not a waived failure.
+
+All 17 harness self-tests pass in each allocation. Checkpoint-dependent cases use
+the same checkpoint created by the frozen baseline. No comparison fields were
+ignored or waived.
+
+Subsequent PR head `4d3adb4cbb0290cc71a0fb012408dcd97223a40d` only fixes import
+formatting/order in six tests; production code is unchanged. Its GitHub linting
+check passes. The 38-case execution above remains attributed to `edc8f67b2`, not
+relabeled as a run on the lint-only follow-up.
+
+## Focused profiling runtime evidence — 2026-09-22
 
 Eight runtime cases pass exactly against frozen main. Zero captured configuration
 differences or execution/capture errors. The candidate reads profiling settings
@@ -54,7 +93,8 @@ equality, convergence, performance equivalence, or every model/script combinatio
 The nsys case exercises CUDA-profiler/NVTX APIs without an external Nsight capture;
 Chakra and OOM callbacks have targeted unit coverage only.
 
-The manifest has 52 available cases; this report covers eight, not a full matrix
-rerun. The separate [PR7418 report](RESULTS.md) retains its own pinned validation.
+The manifest has 52 available cases. The current broad run covers the original 38;
+the separate eight-case profiling run above is pinned to its own earlier candidate.
+The separate [PR7418 report](RESULTS.md) retains its own pinned validation.
 Raw artifacts and private environment paths are not published. This page keeps
 only the current result; Git preserves previous revisions.
