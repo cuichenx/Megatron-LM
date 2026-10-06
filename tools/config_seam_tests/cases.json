@@ -111,6 +111,12 @@
       "options": {"--hybrid-layer-pattern": "**", "--padded-vocab-size": "512"}
     },
     {
+      "name": "hybrid_te_tracker",
+      "entrypoint": "pretrain_hybrid.py",
+      "tier": "builder",
+      "options": {"--hybrid-layer-pattern": "**", "--padded-vocab-size": "512", "--te-rng-tracker": true}
+    },
+    {
       "name": "hybrid_derived",
       "entrypoint": "pretrain_hybrid.py",
       "tier": "builder",

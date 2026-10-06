@@ -16,7 +16,6 @@ main is not required; do not advance the baseline between runs. Prepare two clea
 worktrees at exact commits, then run from this directory:
 
 ```bash
-uv run --no-sync python -m unittest -v test_snapshot
 uv run --no-sync python compare_config_seams.py \
   --baseline /path/to/main-worktree \
   --candidate /path/to/pr-worktree \
@@ -88,6 +87,14 @@ case uses its specified baseline seed scenario; the DP cases share a two-rank
 baseline checkpoint with data-parallel random initialization enabled.
 These comparisons supplement the product's native/deleted-args ownership tests.
 See [the RNGConfig report](RNG_RESULTS.md) for pinned validation results.
+
+Also run the one-GPU builder case `hybrid_te_tracker`. It captures the Hybrid
+config with `--te-rng-tracker`, covering the field-propagation inconsistency
+exposed by the Hybrid-MoE unit-test golden without invoking that unit test or
+constructing its large model. A baseline that misses the CLI-to-model mapping
+will report `use_te_rng_tracker: false -> true`; retain and explain that raw
+difference rather than suppressing it. This suite runs capture/compare cases
+only, not product unit tests or harness self-tests.
 
 `capture_config_seams.py` runs the checkout's actual `pretrain_gpt.py` (or
 `pretrain_hybrid.py` for Hybrid builder cases, or `pretrain_vlm.py` for the VLM case) as `__main__`.
