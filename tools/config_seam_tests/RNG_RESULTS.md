@@ -1,50 +1,89 @@
 # RNGConfig ownership results
 
-Validated on 2026-09-22 with H100 GPUs and the same `26.10.rc0` environment on
-both sides. The baseline is frozen at
-`5e85e2b27fc29bcf938e8f3b38acfbdecffcc8f3` (includes merged PR7418).
+Validated on **2026-10-06** after pushing the Hybrid-MoE golden correction in
+[#7591](https://github.com/NVIDIA/Megatron-LM/pull/7591).
 
-- Candidate ([draft #7591](https://github.com/NVIDIA/Megatron-LM/pull/7591)):
-  `c52002e64c5fe6798042a9d2ced709c465cb95e4`.
-- Tested fork-only harness: `40738bfed9b80a774eedeee4c1b0cd7e5ba716a4`.
+- Frozen main baseline: `fbbe6eb5490de4c81c51bd8f715f333c91837fe4`.
+- Candidate: `bc02ca029c89f6452b8b80d6744f95144b861566`.
+- Both sides: H100 GPUs, `nvcr.io/nvidian/nemo:26.10.rc0`.
+- Current capture-only harness: `4ace84a5befc2b6983bd67c2433aebe24b8efb54`.
 
-All unit, one-GPU and two-GPU comparisons tested this exact candidate commit,
-with the global run-config access pattern and original runtime APIs.
+Only the additional args/configuration capture-and-compare suite ran.
+**No product unit tests or harness self-tests ran.**
 
 ## Results
 
-| Selection | GPUs | Result |
+All **53 unique manifest cases** completed: **50 exact passes, two explained
+configuration mismatches, and one expected CLI rejection**. There are no remaining
+capture errors after correcting and rerunning the invalid profiler fixture below.
+The strict comparator retains the two mismatches; this is not an all-identical run.
+
+| Selection | Cases | Result |
 |---|---:|---|
-| `runtime_fresh`, `runtime_resume` | 1 | Exact pass |
-| `rng_custom_seed`, `rng_te_tracker`, `rng_inference_tracker` | 1 | Exact pass |
-| `rng_dp_fresh`, `rng_dp_resume` | 2 | Exact pass on both ranks |
-| `hybrid_known` (configuration only) | 1 | Exact pass at final head |
+| One-rank builder/configuration captures | 29 | 27 exact passes, one tracker mismatch, one expected rejection |
+| One-rank runtime captures | 17 | 16 exact passes, one tracker mismatch |
+| Two-rank runtime captures | 6 | All exact passes on both ranks |
+| Eight-rank TP2/PP2/DP2 runtime capture | 1 | Exact pass on all ranks |
 
-All seven runtime comparisons have zero configuration/consumer differences and
-zero capture errors. Each resume scenario uses the same baseline-produced
-checkpoint for both revisions. RNG observations include exact Python/NumPy state
-and hashes of CPU/CUDA/tracker state, captured without drawing random values.
+The two-rank cases are `rng_dp_fresh`, `rng_dp_resume`, `runtime_moe_ep2`,
+`runtime_context_parallel2`, `runtime_tp2_sequence_overlap`, and
+`runtime_interleaved_pipeline`. The eight-rank case is `runtime_tp2_pp2_dp2`.
+Single-rank coverage includes tokenizer/vocabulary resolution, batch schedules,
+checkpoint precedence and resume, logging, profiling, dense and MoE configurations,
+Hybrid/Mamba, recomputation, FSDP2 configuration, fine-tuning, and VLM training.
+See [cases.json](cases.json) for the complete selection and options.
 
-The focused product unit selection passed **328 candidate / 294 baseline tests**,
-with three identical skips and no failures/errors. This includes 31 new ownership
-cases, an added checkpoint ownership variant and sparse legacy-bootstrap coverage.
-The legacy checkpoint test also
-passed both shared-stream and DP-specific-stream variants on each of two ranks,
-including exact CPU RNG restoration with legacy RNG fields removed.
+### Reviewed tracker differences
 
-All 17 harness self-tests pass. Independent product and harness reviews found no
-outstanding blockers. Changed-file formatting, syntax and whitespace checks pass;
-all-files lint retains only untouched baseline findings.
+Both cases explicitly enable `--te-rng-tracker`. Centralized propagation now
+correctly sets the model's differently named `use_te_rng_tracker` field to `true`;
+the baseline args adapter left that field `false`.
 
-## Reproduce and limits
+| Case | Exact differing paths, all `false` → `true` |
+|---|---|
+| `rng_te_tracker` | `rank[0].config.model[0].fields.transformer.fields.use_te_rng_tracker`; `rank[0].consumer.model[0].config.fields.use_te_rng_tracker`; `rank[0].consumer.ddp[0].config.fields.use_te_rng_tracker` |
+| `hybrid_te_tracker` | `rank[0].config.model[0].fields.transformer.fields.use_te_rng_tracker` |
 
-Follow the [README](README.md) with the pinned revisions above. Run one-GPU and
-two-GPU case groups separately. The harness is fork-only and is not included in
-the product PR. Report files record revision/tree, environment, harness and
-fixture hashes; raw checkpoints and rank logs are not committed here.
+These are the only configuration/consumer differences. All captured seeding inputs
+and RNG states match, including the runtime tracker case. RNG observations record
+Python/NumPy state and hashes of CPU/CUDA/tracker state without drawing random values.
+Resume comparisons use the same baseline-produced checkpoint on both sides.
 
-This is a targeted eight-case result (seven runtime, one configuration-only),
-not a rerun of all 52 manifest cases. The Hybrid case does not run training.
-Full-suite, exhaustive model-family, convergence and performance validation are
-not claimed. Deleted/divergent-args ownership is established by behavioral product
-tests; equivalent CLI runs alone do not prove ownership.
+The added `hybrid_te_tracker` builder capture covers the mapping inconsistency
+exposed by the Hybrid-MoE golden. It does not construct the large unit-test model
+or rerun that unit test. No mismatch was suppressed or converted into an exact pass.
+
+### Expected rejection and fixture correction
+
+`invalid_batch_conflict` rejects the simultaneous explicit `--global-batch-size`
+and `--step-batch-size-schedule` flags on both revisions, with the expected error.
+
+The original `profiling_excluded_rank` fixture used start/end steps `2/2`.
+Both revisions rejected this with
+`PyTorch profiling requires profile_step_end > profile_step_start`.
+The harness-only correction changes the end to `3`, retaining excluded rank `1`.
+Rerunning this case against the same frozen product commits gives an exact pass.
+The original error remains in the archived first-run report; the summary above
+uses its corrected rerun, not an additional unique case. No product fix was needed.
+
+## Provenance and reproduction
+
+The original 52 cases ran with harness `dda469fc5585eb2f5202a02395b98484c7b776e2`.
+The added Hybrid capture ran with `fa6df0401e2f247954917fc9d6f02518c43b2e73`;
+the corrected profiler capture ran with `4ace84a5befc2b6983bd67c2433aebe24b8efb54`.
+The capture, comparison, and snapshot Python implementations are identical across
+these revisions. Only the two manifest changes described above affect the captures.
+The temporary unit-test runner was removed; it was never invoked in this validation.
+
+Follow the [README](README.md), substituting the pinned baseline and candidate above.
+Run the 46 one-rank, six two-rank, and one eight-rank cases in appropriately sized
+allocations. Use only `compare_config_seams.py`; do not invoke unit-test runners.
+Reports retain revision/tree IDs, environment, fixture and harness hashes,
+per-case outcomes, raw field differences, and capture errors. Detailed rank logs,
+snapshots, and shared baseline checkpoints are archived separately, not committed.
+
+This is capture/compare validation, including short real training for runtime-tier
+cases. Builder cases do not train. Full unit-suite, exhaustive model-family,
+convergence, and performance validation are not claimed. Equivalent CLI captures
+alone do not prove that every consumer treats native config as authoritative.
+Earlier reports remain available in Git history.
