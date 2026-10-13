@@ -46,6 +46,25 @@ def logger_settings(config: Any, args: Any) -> dict:
     return {"type": qualified_name(type(config)), "fields": values}
 
 
+def dist_settings(config: Any, ddp: Any, args: Any) -> dict:
+    """Compare distributed settings across the explicit owner/schema moves.
+
+    Preserve all fields except the old FSDP duplicate, whose agreement with its
+    DDP owner is required. Read fake_process_group from CLI only for schemas
+    predating that field; never repair a missing native value from args.
+    """
+    values = {
+        field.name: getattr(config, field.name, {"missing_attribute": True})
+        for field in dataclasses.fields(config)
+    }
+    if "use_megatron_fsdp" in values:
+        if differences(values.pop("use_megatron_fsdp"), ddp.use_megatron_fsdp):
+            raise ValueError("Legacy dist/DDP use_megatron_fsdp values disagree")
+    if "fake_process_group" not in values:
+        values["fake_process_group"] = args.fake_process_group
+    return {"type": qualified_name(type(config)), "fields": values}
+
+
 def encode(value: Any, roots: dict[str, str] | None = None, references: dict[int, dict] | None = None) -> Any:
     """Encode supported semantic values; reject unsupported objects, never use repr."""
     roots = roots or {}

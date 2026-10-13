@@ -14,7 +14,7 @@ import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
-from snapshot import encode, logger_settings
+from snapshot import dist_settings, encode, logger_settings
 
 
 def build_dataset_config(dataset_provider, args):
@@ -54,7 +54,7 @@ def main() -> None:
     def record(name, value, references=None):
         result["captures"].setdefault(name, []).append(encode(value, roots, references))
 
-    def observe_call(owner, name, capture_name, excluded=(), after=None):
+    def observe_call(owner, name, capture_name, excluded=(), after=None, included=None):
         original = getattr(owner, name)
         signature = inspect.signature(original)
 
@@ -76,7 +76,13 @@ def main() -> None:
                     for parameter_name, parameter in bound.arguments["module"].named_parameters()
                 }
             record(
-                capture_name, {key: value for key, value in bound.arguments.items() if key not in excluded}, references
+                capture_name,
+                {
+                    key: value
+                    for key, value in bound.arguments.items()
+                    if key not in excluded and (included is None or key in included)
+                },
+                references,
             )
             output = original(*args, **kwargs)
             if after is not None:
@@ -137,6 +143,7 @@ def main() -> None:
             for field in (
                 "optimizer",
                 "ddp",
+                "dist",
                 "scheduler",
                 "checkpoint",
                 "logger",
@@ -150,6 +157,9 @@ def main() -> None:
                 if field == "logger":
                     result["logger_schema_fields"] = [field.name for field in dataclasses.fields(value)]
                     value = logger_settings(value, cli)
+                elif field == "dist":
+                    result["raw_dist_config"] = encode(value, roots)
+                    value = dist_settings(value, cfg.ddp, cli)
                 record("config." + field, value)
             record(
                 "runtime.services",
@@ -165,14 +175,26 @@ def main() -> None:
                 "runtime.batch",
                 {
                     "global": batches.get_current_global_batch_size(),
+                    "running_global": batches.get_current_running_global_batch_size(),
                     "microbatches": batches.get_num_microbatches(),
                     "resolved_global": cli.global_batch_size,
                     "eval_global": cli.eval_global_batch_size,
                     "eval_micro": cli.eval_micro_batch_size,
                 },
             )
+            if case.get("build_inference_config"):
+                # Deliberate builder-only check of MLM's real inference adapter.
+                # Pretraining does not itself construct or run an inference engine.
+                if case["tier"] != "builder":
+                    raise ValueError("Inference config probes must use the builder tier")
+                from megatron.training.argument_utils import inference_cfg_from_args
+
+                record("builder.inference", inference_cfg_from_args(cli))
             if case["tier"] == "runtime":
                 return original_pretrain(cfg, dataset_provider, *args, **kwargs)
+            if case["tier"] == "startup":
+                record("startup.entrypoint", {"path": entrypoint, "reached_pretrain": True})
+                return
             # Builder tier: execute the real dataset builder and scheduler derivation,
             # but do NOT claim model/optimizer/DDP construction or checkpoint I/O.
             build_dataset_config(dataset_provider, cli)
@@ -190,6 +212,7 @@ def main() -> None:
                     {
                         "consumed": consumed,
                         "global": batches.get_current_global_batch_size(),
+                        "running_global": batches.get_current_running_global_batch_size(),
                         "microbatches": batches.get_num_microbatches(),
                     },
                 )
@@ -197,11 +220,14 @@ def main() -> None:
         package.pretrain = entry
         training.pretrain = entry
         if case["tier"] == "runtime":
-            from torch.utils.tensorboard import SummaryWriter
-            from megatron.training import initialize
-            from megatron.core import tensor_parallel
-            import numpy as np
             import random
+
+            import numpy as np
+            from torch.utils.tensorboard import SummaryWriter
+
+            from megatron.core import tensor_parallel
+            from megatron.training import initialize
+            from megatron.training.datasets import data_samplers
 
             def rng_snapshot():
                 def tensor_digest(state):
@@ -226,14 +252,57 @@ def main() -> None:
             )
             observe_call(SummaryWriter, "__init__", "consumer.tensorboard", excluded=("self",))
             observe_call(globals_.Timers, "__init__", "consumer.timers", excluded=("self",))
+            # Observe resolved loader/sampler inputs, not dataset instances, worker
+            # closures or generator addresses. In particular, num_workers must be
+            # checked at its consumer rather than merely repeated from the CLI.
+            observe_call(
+                torch.utils.data.DataLoader,
+                "__init__",
+                "consumer.dataloader",
+                included=(
+                    "batch_size", "shuffle", "num_workers", "pin_memory", "drop_last",
+                    "timeout", "prefetch_factor", "persistent_workers", "pin_memory_device",
+                ),
+            )
+            for sampler in (
+                "MegatronPretrainingSampler",
+                "MegatronPretrainingRandomSampler",
+                "MegatronFullValidationSampler",
+            ):
+                observe_call(
+                    getattr(data_samplers, sampler), "__init__", "consumer." + sampler,
+                    excluded=("self", "dataset"),
+                )
             observe_call(torch.profiler, "schedule", "consumer.profiler_schedule")
             observe_call(torch.cuda.memory, "_dump_snapshot", "consumer.memory_snapshot")
             observe_call(GPTModel, "__init__", "consumer.model", excluded=("self",))
             if entrypoint == "pretrain_vlm.py":
+                from megatron.core.models.multimodal import context_parallel
                 from megatron.core.models.multimodal.llava_model import LLaVAModel
 
                 observe_call(LLaVAModel, "__init__", "consumer.vlm", excluded=("self",))
                 observe_call(LLaVAModel, "freeze", "consumer.vlm_freeze", excluded=("self",))
+                # Later calls pass tensor-valued sequence lengths. Observe the
+                # scalar policy inputs, and assert resolved lengths at LLaVAModel.
+                observe_call(
+                    context_parallel, "get_padding", "consumer.vlm_padding",
+                    included=("cp_size", "tp_size", "has_sp", "decoder_tp_comm_overlap", "decoder_seq_len"),
+                )
+                observe_call(
+                    context_parallel, "get_packed_seq_params", "consumer.vlm_packing_inputs",
+                    included=("cp_size", "use_packed_sequence"),
+                    after=lambda args, output: record("consumer.vlm_packing", {"qkv_format": output.qkv_format}),
+                )
+            if case.get("observe_tp_overlap"):
+                from transformer_engine.pytorch import module as te_module
+
+                # Record the actual parsed userbuffer configuration handed to TE,
+                # rather than reading the CLI file ourselves. These cases use BF16;
+                # quantization-mode enums and TE's runtime objects are not projected.
+                observe_call(
+                    te_module.base, "initialize_ub", "consumer.tp_overlap",
+                    included=("shape", "tp_size", "ub_cfgs", "bootstrap_backend", "use_fp8"),
+                )
             observe_call(DistributedDataParallel, "__init__", "consumer.ddp", excluded=("self", "module"))
             observe_call(training, "get_megatron_optimizer", "consumer.optimizer", excluded=("model_chunks", "timers"))
             original_save = training.save_checkpoint
@@ -267,8 +336,13 @@ def main() -> None:
             for token, value in replacements.items():
                 argument = argument.replace(token, value)
             argv.append(argument)
-        if entrypoint not in ("pretrain_gpt.py", "pretrain_hybrid.py", "pretrain_vlm.py"):
+        if entrypoint not in (
+            "pretrain_gpt.py", "pretrain_hybrid.py", "pretrain_vlm.py", "examples/multimodal/train.py"
+        ):
             raise ValueError("Unsupported entrypoint")
+        # Match Python's direct-script import path, including multimodal's
+        # sibling imports (model, dataloader_provider, multimodal_args).
+        sys.path.insert(0, str((options.repo / entrypoint).parent.resolve()))
         sys.argv = [str(options.repo / entrypoint), *argv]
         runpy.run_path(sys.argv[0], run_name="__main__")
         result["status"] = "ok"

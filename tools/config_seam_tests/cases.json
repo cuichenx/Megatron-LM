@@ -51,6 +51,7 @@
     "config.model",
     "config.optimizer",
     "config.ddp",
+    "config.dist",
     "config.scheduler",
     "config.checkpoint",
     "config.logger",
@@ -68,6 +69,1372 @@
     "consumer.scheduler"
   ],
   "cases": [
+    {
+      "name": "multimodal_train_startup",
+      "tier": "startup",
+      "entrypoint": "examples/multimodal/train.py",
+      "options": {
+        "--language-model-type": "llama3_8b",
+        "--tokenizer-prompt-format": "llama3",
+        "--vision-model-type": "clip",
+        "--decoder-seq-length": "32",
+        "--img-h": "28",
+        "--img-w": "28",
+        "--patch-dim": "14"
+      },
+      "expected": {
+        "startup.entrypoint": {
+          "path": "examples/multimodal/train.py",
+          "reached_pretrain": true
+        }
+      }
+    },
+    {
+      "name": "coverage_tp_overlap_bulk_off",
+      "tier": "runtime",
+      "ranks": 2,
+      "observe_tp_overlap": true,
+      "environment": {
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1"
+      },
+      "options": {
+        "--tensor-model-parallel-size": "2",
+        "--sequence-parallel": true,
+        "--tp-comm-overlap": true,
+        "--seq-length": "128",
+        "--max-position-embeddings": "128",
+        "--exit-interval": "2",
+        "--no-tp-comm-bulk-wgrad": true,
+        "--no-tp-comm-bulk-dgrad": true
+      },
+      "expected": {
+        "consumer.tp_overlap": {
+          "shape": [
+            128,
+            128
+          ],
+          "tp_size": 2
+        },
+        "consumer.model": {
+          "config.fields.tp_comm_overlap": true,
+          "config.fields.tp_comm_bulk_wgrad": false,
+          "config.fields.tp_comm_bulk_dgrad": false
+        }
+      }
+    },
+    {
+      "name": "coverage_tp_overlap_collectives_off",
+      "tier": "runtime",
+      "ranks": 2,
+      "observe_tp_overlap": true,
+      "environment": {
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1"
+      },
+      "options": {
+        "--tensor-model-parallel-size": "2",
+        "--sequence-parallel": true,
+        "--tp-comm-overlap": true,
+        "--seq-length": "128",
+        "--max-position-embeddings": "128",
+        "--exit-interval": "2",
+        "--no-tp-comm-overlap-ag": true,
+        "--no-tp-comm-overlap-rs": true
+      },
+      "expected": {
+        "consumer.tp_overlap": {
+          "shape": [
+            128,
+            128
+          ],
+          "tp_size": 2
+        },
+        "consumer.model": {
+          "config.fields.tp_comm_overlap": true,
+          "config.fields.tp_comm_overlap_ag": false,
+          "config.fields.tp_comm_overlap_rs": false
+        }
+      }
+    },
+    {
+      "name": "coverage_tp_overlap_legacy_config",
+      "tier": "builder",
+      "ranks": 2,
+      "options": {
+        "--tensor-model-parallel-size": "2",
+        "--sequence-parallel": true,
+        "--tp-comm-overlap": true,
+        "--seq-length": "128",
+        "--max-position-embeddings": "128",
+        "--exit-interval": "2",
+        "--no-tp-comm-split-ag": true,
+        "--no-tp-comm-split-rs": true,
+        "--tp-comm-overlap-rs-dgrad": true
+      },
+      "expected": {
+        "config.model": {
+          "fields.transformer.fields.tp_comm_overlap": true,
+          "fields.transformer.fields.tp_comm_split_ag": false,
+          "fields.transformer.fields.tp_comm_split_rs": false,
+          "fields.transformer.fields.tp_comm_overlap_rs_dgrad": true
+        }
+      }
+    },
+    {
+      "name": "coverage_vlm_freeze_language",
+      "tier": "runtime",
+      "entrypoint": "pretrain_vlm.py",
+      "options": {
+        "--num-layers": false,
+        "--decoder-num-layers": "2",
+        "--encoder-num-layers": "1",
+        "--img-h": "28",
+        "--img-w": "28",
+        "--patch-dim": "14",
+        "--ckpt-format": "torch",
+        "--no-gradient-accumulation-fusion": true,
+        "--attention-dropout": "0",
+        "--hidden-dropout": "0",
+        "--exit-interval": "2",
+        "--dataloader-seq-length": "24",
+        "--disable-vision-class-token": true,
+        "--freeze-LM": true
+      },
+      "expected": {
+        "consumer.vlm": {
+          "drop_vision_class_token": true,
+          "language_max_sequence_length": 28
+        },
+        "consumer.dataset": {
+          "fields.sequence_length": 24
+        },
+        "consumer.vlm_freeze": {
+          "freeze_language_model": true,
+          "freeze_vision_model": false,
+          "freeze_vision_projection": false
+        }
+      }
+    },
+    {
+      "name": "coverage_vlm_projection_only",
+      "tier": "runtime",
+      "entrypoint": "pretrain_vlm.py",
+      "options": {
+        "--num-layers": false,
+        "--decoder-num-layers": "2",
+        "--encoder-num-layers": "1",
+        "--img-h": "28",
+        "--img-w": "28",
+        "--patch-dim": "14",
+        "--ckpt-format": "torch",
+        "--no-gradient-accumulation-fusion": true,
+        "--attention-dropout": "0",
+        "--hidden-dropout": "0",
+        "--exit-interval": "2",
+        "--dataloader-seq-length": "24",
+        "--disable-vision-class-token": true,
+        "--freeze-LM": true,
+        "--freeze-ViT": true
+      },
+      "expected": {
+        "consumer.vlm": {
+          "drop_vision_class_token": true,
+          "language_max_sequence_length": 28
+        },
+        "consumer.dataset": {
+          "fields.sequence_length": 24
+        },
+        "consumer.vlm_freeze": {
+          "freeze_language_model": true,
+          "freeze_vision_model": true,
+          "freeze_vision_projection": false
+        }
+      }
+    },
+    {
+      "name": "coverage_vlm_packed_cp",
+      "tier": "runtime",
+      "entrypoint": "pretrain_vlm.py",
+      "ranks": 2,
+      "options": {
+        "--num-layers": false,
+        "--decoder-num-layers": "2",
+        "--encoder-num-layers": "1",
+        "--img-h": "28",
+        "--img-w": "28",
+        "--patch-dim": "14",
+        "--ckpt-format": "torch",
+        "--no-gradient-accumulation-fusion": true,
+        "--attention-dropout": "0",
+        "--hidden-dropout": "0",
+        "--exit-interval": "2",
+        "--dataloader-seq-length": "24",
+        "--disable-vision-class-token": true,
+        "--context-parallel-size": "2",
+        "--micro-batch-size": "2",
+        "--use-packed-sequence": true
+      },
+      "expected": {
+        "consumer.vlm": {
+          "drop_vision_class_token": true,
+          "language_max_sequence_length": 56
+        },
+        "consumer.dataset": {
+          "fields.sequence_length": 24
+        },
+        "consumer.vlm_packing_inputs": {
+          "cp_size": 2,
+          "use_packed_sequence": true
+        },
+        "consumer.vlm_packing": {
+          "qkv_format": "thd"
+        }
+      }
+    },
+    {
+      "name": "coverage_vlm_decoder_overlap",
+      "tier": "runtime",
+      "entrypoint": "pretrain_vlm.py",
+      "ranks": 2,
+      "observe_tp_overlap": true,
+      "environment": {
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1"
+      },
+      "options": {
+        "--num-layers": false,
+        "--decoder-num-layers": "2",
+        "--encoder-num-layers": "1",
+        "--img-h": "28",
+        "--img-w": "28",
+        "--patch-dim": "14",
+        "--ckpt-format": "torch",
+        "--no-gradient-accumulation-fusion": true,
+        "--attention-dropout": "0",
+        "--hidden-dropout": "0",
+        "--exit-interval": "2",
+        "--dataloader-seq-length": "24",
+        "--disable-vision-class-token": true,
+        "--tensor-model-parallel-size": "2",
+        "--sequence-parallel": true,
+        "--tp-comm-overlap": true,
+        "--decoder-tp-comm-overlap": true,
+        "--decoder-seq-length": "128",
+        "--max-position-embeddings": "128",
+        "--tp-comm-overlap-cfg": "{fixtures}/tp_overlap.json"
+      },
+      "expected": {
+        "consumer.vlm": {
+          "language_max_sequence_length": 128,
+          "language_transformer_config.fields.tp_comm_overlap": true,
+          "vision_transformer_config.fields.tp_comm_overlap": false,
+          "vision_projection_config.fields.tp_comm_overlap": false
+        },
+        "consumer.vlm_padding": {
+          "tp_size": 2,
+          "has_sp": true,
+          "decoder_tp_comm_overlap": true,
+          "decoder_seq_len": 128
+        },
+        "consumer.tp_overlap": {
+          "shape": [
+            128,
+            128
+          ],
+          "tp_size": 2,
+          "ub_cfgs": {
+            "qkv_fprop": {
+              "method": "ring_exchange",
+              "aggregate": 1
+            },
+            "fc1_fprop": {
+              "method": "ring_exchange",
+              "aggregate": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "coverage_tp_overlap_default",
+      "tier": "runtime",
+      "ranks": 2,
+      "observe_tp_overlap": true,
+      "environment": {
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1"
+      },
+      "options": {
+        "--tensor-model-parallel-size": "2",
+        "--sequence-parallel": true,
+        "--tp-comm-overlap": true,
+        "--seq-length": "128",
+        "--max-position-embeddings": "128",
+        "--exit-interval": "2"
+      },
+      "expected": {
+        "consumer.tp_overlap": {
+          "shape": [
+            128,
+            128
+          ],
+          "tp_size": 2,
+          "ub_cfgs": {}
+        }
+      }
+    },
+    {
+      "name": "coverage_tp_overlap_file",
+      "tier": "runtime",
+      "ranks": 2,
+      "observe_tp_overlap": true,
+      "environment": {
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1"
+      },
+      "options": {
+        "--tensor-model-parallel-size": "2",
+        "--sequence-parallel": true,
+        "--tp-comm-overlap": true,
+        "--seq-length": "128",
+        "--max-position-embeddings": "128",
+        "--exit-interval": "2",
+        "--tp-comm-overlap-cfg": "{fixtures}/tp_overlap.json",
+        "--tp-comm-bootstrap-backend": "gloo"
+      },
+      "expected": {
+        "consumer.tp_overlap": {
+          "shape": [
+            128,
+            128
+          ],
+          "tp_size": 2,
+          "bootstrap_backend": "gloo",
+          "ub_cfgs": {
+            "qkv_fprop": {
+              "method": "ring_exchange",
+              "aggregate": 1
+            },
+            "fc1_fprop": {
+              "method": "ring_exchange",
+              "aggregate": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "coverage_inference_static_config",
+      "tier": "builder",
+      "build_inference_config": true,
+      "options": {
+        "--inference-max-seq-length": "64",
+        "--inference-max-requests": "2",
+        "--inference-text-gen-server-logging": true
+      },
+      "expected": {
+        "builder.inference": {
+          "fields.inference_max_seq_length": 64,
+          "fields.inference_max_requests": 2,
+          "fields.inference_text_gen_server_logging": true,
+          "fields.inference_dynamic_batching": false
+        }
+      }
+    },
+    {
+      "name": "coverage_inference_dynamic_config",
+      "tier": "builder",
+      "build_inference_config": true,
+      "options": {
+        "--inference-dynamic-batching": true,
+        "--inference-max-seq-length": "64",
+        "--inference-dynamic-batching-buffer-size-gb": "0.03125",
+        "--inference-dynamic-batching-block-size": "256",
+        "--inference-dynamic-batching-max-requests": "4",
+        "--inference-dynamic-batching-max-tokens": "256",
+        "--inference-dynamic-batching-sampling-backend": "torch",
+        "--enable-chunked-prefill": true,
+        "--inference-dynamic-batching-prefix-caching": true
+      },
+      "expected": {
+        "builder.inference": {
+          "fields.inference_dynamic_batching": true,
+          "fields.inference_max_seq_length": 64,
+          "fields.inference_dynamic_batching_buffer_size_gb": 0.03125,
+          "fields.inference_dynamic_batching_block_size": 256,
+          "fields.inference_dynamic_batching_max_requests": 4,
+          "fields.inference_dynamic_batching_max_tokens": 256,
+          "fields.inference_dynamic_batching_sampling_backend": "torch",
+          "fields.enable_chunked_prefill": true,
+          "fields.inference_dynamic_batching_enable_prefix_caching": true
+        }
+      }
+    },
+    {
+      "name": "coverage_inference_resume_config",
+      "tier": "builder",
+      "build_inference_config": true,
+      "needs_checkpoint": true,
+      "options": {
+        "--load": "{checkpoint}",
+        "--use-checkpoint-args": true,
+        "--inference-max-seq-length": "48",
+        "--no-inference-text-gen-server-logging": true
+      },
+      "expected": {
+        "builder.inference": {
+          "fields.inference_max_seq_length": 48,
+          "fields.inference_text_gen_server_logging": false
+        }
+      }
+    },
+    {
+      "name": "coverage_tokenizer_vocab_file",
+      "tier": "builder",
+      "options": {
+        "--tokenizer-type": "HuggingFaceTokenizer",
+        "--tokenizer-model": "{fixtures}/tokenizer/bert",
+        "--vocab-file": "{fixtures}/tokenizer/bert-vocab.txt"
+      },
+      "coverage_note": "Local WordPiece fixture exercises vocab_file forwarding without relying on the legacy BertWordPieceLowerCase alias's remote bert-large-uncased metadata.",
+      "expected": {
+        "config.tokenizer": {"fields.vocab_file": "<fixtures>/tokenizer/bert-vocab.txt"},
+        "runtime.tokenizer": {"vocab_size": 261},
+        "runtime.tokenizer_inputs": {"vocab_file": "<fixtures>/tokenizer/bert-vocab.txt"}
+      }
+    },
+    {
+      "name": "coverage_checkpoint_override_iteration",
+      "tier": "runtime",
+      "needs_checkpoint": true,
+      "options": {"--load": "{checkpoint}", "--override-ckpt-iteration": "3"},
+      "expected": {"runtime.checkpoint_load": {"tuple.0": 3}}
+    },
+    {
+      "name": "coverage_checkpoint_local_config",
+      "tier": "builder",
+      "options": {
+        "--non-persistent-ckpt-type": "local",
+        "--non-persistent-local-ckpt-dir": "{run}/local-checkpoint",
+        "--non-persistent-local-ckpt-algo": "atomic",
+        "--non-persistent-save-interval": "1"
+      },
+      "expected": {"config.checkpoint": {"fields.non_persistent_ckpt_type": "local", "fields.non_persistent_local_ckpt_algo": "atomic"}},
+      "coverage_note": "Requires nvidia-resiliency-ext local checkpoint imports. Configuration only, no local checkpoint save/recovery claim."
+    },
+    {
+      "name": "coverage_scheduler_wsd_iters",
+      "tier": "builder",
+      "options": {
+        "--lr-decay-style": "WSD",
+        "--lr-wsd-decay-iters": "2",
+        "--lr-wsd-decay-style": "cosine",
+        "--lr-warmup-init": "0.00002"
+      },
+      "expected": {
+        "config.scheduler": {
+          "fields.lr_decay_style": "WSD",
+          "fields.lr_wsd_decay_iters": 2,
+          "fields.lr_wsd_decay_style": "cosine",
+          "fields.lr_warmup_init": 0.00002
+        }
+      }
+    },
+    {
+      "name": "coverage_scheduler_wsd_samples",
+      "tier": "builder",
+      "options": {
+        "--train-iters": false,
+        "--lr-decay-iters": false,
+        "--lr-warmup-iters": false,
+        "--train-samples": "32",
+        "--lr-decay-samples": "32",
+        "--lr-warmup-samples": "4",
+        "--lr-decay-style": "WSD",
+        "--lr-wsd-decay-samples": "16",
+        "--lr-wsd-decay-style": "linear"
+      },
+      "expected": {
+        "config.scheduler": {
+          "fields.lr_wsd_decay_samples": 16,
+          "fields.lr_wsd_decay_style": "linear"
+        }
+      }
+    },
+    {
+      "name": "coverage_scheduler_fraction_inverse_sqrt",
+      "tier": "builder",
+      "options": {
+        "--lr-warmup-iters": false,
+        "--lr-warmup-fraction": "0.25",
+        "--lr-warmup-init": "0.00001",
+        "--lr-decay-style": "inverse-square-root"
+      },
+      "expected": {
+        "config.scheduler": {
+          "fields.lr_warmup_fraction": 0.25,
+          "fields.lr_decay_style": "inverse-square-root"
+        }
+      }
+    },
+    {
+      "name": "coverage_scheduler_constant_cosine_wd",
+      "tier": "builder",
+      "options": {
+        "--lr-decay-style": "constant",
+        "--weight-decay-incr-style": "cosine",
+        "--start-weight-decay": "0.02",
+        "--end-weight-decay": "0.08"
+      },
+      "expected": {
+        "config.scheduler": {
+          "fields.lr_decay_style": "constant",
+          "fields.weight_decay_incr_style": "cosine"
+        }
+      }
+    },
+    {
+      "name": "coverage_scheduler_resume_checkpoint_policy",
+      "tier": "runtime",
+      "options": {
+        "--load": "{checkpoint}",
+        "--use-checkpoint-opt-param-scheduler": true,
+        "--lr-decay-style": "cosine"
+      },
+      "expected": {
+        "config.scheduler": {
+          "fields.use_checkpoint_opt_param_scheduler": true
+        }
+      },
+      "needs_checkpoint": true,
+      "coverage_note": "Current-run constructor inputs plus checkpoint-selected scheduler restoration; no --use-checkpoint-args. Keep max/min LR equal to the seed because optimizer checkpoint group keys include those values; vary decay style instead."
+    },
+    {
+      "name": "coverage_validation_batches",
+      "tier": "runtime",
+      "options": {
+        "--eval-micro-batch-size": "2",
+        "--eval-global-batch-size": "8",
+        "--eval-interval": "1",
+        "--start-eval-at-iter": "2",
+        "--train-iters": "3"
+      },
+      "expected": {
+        "config.validation": {
+          "fields.eval_micro_batch_size": 2,
+          "fields.eval_global_batch_size": 8,
+          "fields.start_eval_at_iter": 2
+        },
+        "consumer.MegatronPretrainingSampler": {
+          "micro_batch_size": 2
+        },
+        "consumer.dataloader": {
+          "num_workers": 0
+        }
+      }
+    },
+    {
+      "name": "coverage_validation_full",
+      "tier": "builder",
+      "options": {
+        "--full-validation": true,
+        "--train-iters": "2",
+        "--eval-interval": "1"
+      },
+      "expected": {
+        "config.validation": {
+          "fields.full_validation": true
+        }
+      },
+      "coverage_note": "Configuration only: full validation over the default mock corpus is not a bounded smoke run. A tiny real indexed-data fixture is needed for runtime coverage."
+    },
+    {
+      "name": "coverage_validation_only_config",
+      "tier": "builder",
+      "options": {
+        "--skip-train": true,
+        "--eval-iters": "2"
+      },
+      "expected": {
+        "config.validation": {
+          "fields.skip_train": true
+        }
+      },
+      "coverage_note": "Configuration only: builder does not claim evaluation-only control-flow coverage."
+    },
+    {
+      "name": "coverage_validation_multiple_config",
+      "tier": "builder",
+      "options": {
+        "--mock-data": false,
+        "--train-data-path": "{fixtures}/train",
+        "--valid-data-path": [
+          "{fixtures}/valid-a",
+          "{fixtures}/valid-b"
+        ],
+        "--multiple-validation-sets": true,
+        "--validation-set-names": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "expected": {
+        "config.validation": {
+          "fields.multiple_validation_sets": true,
+          "fields.validation_set_names": [
+            "alpha",
+            "beta"
+          ]
+        }
+      },
+      "coverage_note": "Blend/config construction only; these symbolic dataset prefixes are not opened. No multi-dataset evaluation claim."
+    },
+    {
+      "name": "coverage_train_gc_memory",
+      "tier": "runtime",
+      "options": {
+        "--manual-gc": true,
+        "--manual-gc-interval": "1",
+        "--no-manual-gc-eval": true,
+        "--empty-unused-memory-level": "2",
+        "--train-sync-interval": "1",
+        "--iterations-to-skip": [
+          "2"
+        ],
+        "--train-iters": "3"
+      },
+      "expected": {
+        "config.train": {
+          "fields.manual_gc": true,
+          "fields.manual_gc_interval": 1,
+          "fields.manual_gc_eval": false,
+          "fields.empty_unused_memory_level": 2,
+          "fields.train_sync_interval": 1,
+          "fields.iterations_to_skip": [
+            2
+          ]
+        }
+      }
+    },
+    {
+      "name": "coverage_train_signal_duration_config",
+      "tier": "builder",
+      "options": {
+        "--exit-signal-handler": true,
+        "--exit-signal": "SIGUSR1",
+        "--exit-signal-handler-for-training": true,
+        "--exit-duration-in-mins": "60",
+        "--gpu-sniff-test-interval": "10"
+      },
+      "expected": {
+        "config.train": {
+          "fields.exit_signal_handler": true,
+          "fields.exit_signal_handler_for_training": true,
+          "fields.exit_duration_in_mins": 60,
+          "fields.gpu_sniff_test_interval": 10
+        }
+      },
+      "coverage_note": "Configuration/handler setup only. Does not send signals, wait for a time limit, or run performance sniff tests."
+    },
+    {
+      "name": "coverage_train_decrease_batch",
+      "tier": "builder",
+      "options": {
+        "--micro-batch-size": "3",
+        "--global-batch-size": "10",
+        "--eval-global-batch-size": "9",
+        "--decrease-batch-size-if-needed": true
+      },
+      "expected": {
+        "runtime.batch": {
+          "global": 10,
+          "running_global": 9,
+          "microbatches": 3
+        },
+        "config.train": {
+          "fields.decrease_batch_size_if_needed": true
+        }
+      }
+    },
+    {
+      "name": "coverage_train_dp_hash",
+      "tier": "runtime",
+      "options": {
+        "--check-weight-hash-across-dp-replicas-interval": "1",
+        "--train-iters": "2"
+      },
+      "expected": {
+        "config.train": {
+          "fields.check_weight_hash_across_dp_replicas_interval": 1
+        }
+      },
+      "ranks": 2
+    },
+    {
+      "name": "coverage_ddp_average_buckets",
+      "tier": "runtime",
+      "options": {
+        "--use-distributed-optimizer": true,
+        "--overlap-grad-reduce": true,
+        "--overlap-param-gather": true,
+        "--ddp-num-buckets": "2",
+        "--ddp-average-in-collective": true,
+        "--ddp-pad-buckets-for-high-nccl-busbw": true,
+        "--check-for-large-grads": true,
+        "--accumulate-allreduce-grads-in-fp32": true,
+        "--train-iters": "2"
+      },
+      "expected": {
+        "config.ddp": {
+          "fields.num_buckets": 2,
+          "fields.average_in_collective": true,
+          "fields.pad_buckets_for_high_nccl_busbw": true,
+          "fields.check_for_large_grads": true,
+          "fields.grad_reduce_in_fp32": true
+        }
+      },
+      "ranks": 2
+    },
+    {
+      "name": "coverage_ddp_bf16_local_fp32_config",
+      "tier": "builder",
+      "options": {
+        "--use-distributed-optimizer": true,
+        "--grad-reduce-in-bf16": true,
+        "--ddp-reduce-scatter-with-fp32-accumulation": true,
+        "--ddp-param-name-patterns-for-fp32-local-accumulation": [
+          "*.layer_norm_weight",
+          "*.bias"
+        ]
+      },
+      "expected": {
+        "config.ddp": {
+          "fields.grad_reduce_in_fp32": false,
+          "fields.reduce_scatter_with_fp32_accumulation": true,
+          "fields.param_name_patterns_for_fp32_local_accumulation": {
+            "tuple": ["*.layer_norm_weight", "*.bias"]
+          }
+        }
+      }
+    },
+    {
+      "name": "coverage_optimizer_precision_aware",
+      "tier": "runtime",
+      "options": {
+        "--use-distributed-optimizer": true,
+        "--use-precision-aware-optimizer": true,
+        "--main-grads-dtype": "fp32",
+        "--main-params-dtype": "fp32",
+        "--exp-avg-dtype": "bf16",
+        "--exp-avg-sq-dtype": "fp32",
+        "--dump-param-to-param-group-map": "{run}/param-groups",
+        "--train-iters": "2"
+      },
+      "expected": {
+        "config.optimizer": {
+          "fields.use_precision_aware_optimizer": true
+        },
+        "consumer.optimizer": {
+          "dump_param_to_param_group_map": "<run>/param-groups"
+        }
+      }
+    },
+    {
+      "name": "coverage_optimizer_muon_layout_config",
+      "tier": "builder",
+      "options": {
+        "--optimizer": "muon",
+        "--use-distributed-optimizer": true,
+        "--no-use-layer-wise-param-layout": true
+      },
+      "expected": {
+        "config.optimizer": {
+          "fields.optimizer": "muon",
+          "fields.use_layer_wise_distributed_optimizer": true
+        }
+      },
+      "coverage_note": "Validation derives use_layer_wise_distributed_optimizer; it is not a raw CLI flag. No Muon training claim."
+    },
+    {
+      "name": "coverage_optimizer_graph_config",
+      "tier": "builder",
+      "options": {
+        "--optimizer-cuda-graph": true,
+        "--te-rng-tracker": true
+      },
+      "expected": {
+        "config.optimizer": {
+          "fields.optimizer_cuda_graph": true
+        }
+      },
+      "coverage_note": "Configuration only; does not claim CUDA graph capture/replay."
+    },
+    {
+      "name": "coverage_optimizer_interleaved_overlap_config",
+      "tier": "builder",
+      "options": {
+        "--num-layers": "4",
+        "--pipeline-model-parallel-size": "2",
+        "--num-layers-per-virtual-pipeline-stage": "1",
+        "--use-distributed-optimizer": true,
+        "--overlap-grad-reduce": true,
+        "--overlap-param-gather": true,
+        "--overlap-param-gather-with-optimizer-step": true,
+        "--ckpt-format": "torch",
+        "--no-align-param-gather": true,
+        "--no-align-grad-reduce": true
+      },
+      "expected": {
+        "config.optimizer": {
+          "fields.overlap_param_gather_with_optimizer_step": true
+        }
+      },
+      "ranks": 2
+    },
+    {
+      "name": "coverage_dist_controls",
+      "tier": "runtime",
+      "options": {
+        "--distributed-backend": "nccl",
+        "--distributed-timeout-minutes": "3",
+        "--distributed-timeout-seconds-after-init": "90",
+        "--disable-jit-fuser": true,
+        "--disable-gloo-process-groups": true,
+        "--train-iters": "2"
+      },
+      "expected": {
+        "config.dist": {
+          "fields.distributed_backend": "nccl",
+          "fields.distributed_timeout_minutes": 3,
+          "fields.distributed_timeout_seconds_after_init": 90,
+          "fields.disable_jit_fuser": true,
+          "fields.use_gloo_process_groups": false
+        }
+      }
+    },
+    {
+      "name": "coverage_dist_flight_recorder",
+      "tier": "runtime",
+      "options": {
+        "--flight-recorder-dump-path": "{run}/flight-recorder",
+        "--flight-recorder-trace-buffer-size": "512",
+        "--no-flight-recorder-dump-on-timeout": true,
+        "--flight-recorder-include-stack-trace": true,
+        "--no-flight-recorder-include-only-active": true,
+        "--no-flight-recorder-extra-dump-on-exec": true,
+        "--train-iters": "2"
+      },
+      "expected": {
+        "config.dist": {
+          "fields.flight_recorder_dump_path": "<run>/flight-recorder",
+          "fields.flight_recorder_trace_buffer_size": 512,
+          "fields.flight_recorder_dump_on_timeout": false,
+          "fields.flight_recorder_include_stack_trace": true,
+          "fields.flight_recorder_include_only_active": false,
+          "fields.flight_recorder_extra_dump_on_exec": false
+        }
+      }
+    },
+    {
+      "name": "coverage_dist_rank_mapping",
+      "tier": "runtime",
+      "options": {
+        "--num-layers": "4",
+        "--pipeline-model-parallel-size": "2",
+        "--use-tp-pp-dp-mapping": true,
+        "--high-priority-stream-groups": [
+          "dp_cp"
+        ],
+        "--train-iters": "2"
+      },
+      "expected": {
+        "config.dist": {
+          "fields.use_tp_pp_dp_mapping": true,
+          "fields.high_priority_stream_groups": [
+            "dp_cp"
+          ]
+        }
+      },
+      "ranks": 4
+    },
+    {
+      "name": "coverage_fsdp_registration_config",
+      "tier": "builder",
+      "options": {
+        "--use-megatron-fsdp": true,
+        "--megatron-fsdp-version": "2",
+        "--use-nccl-ub": true,
+        "--fsdp-manual-registration": true,
+        "--create-all-gather-group": true,
+        "--megatron-fsdp-main-params-dtype": "bf16",
+        "--megatron-fsdp-main-grads-dtype": "fp32",
+        "--megatron-fsdp-grad-comm-dtype": "bf16",
+        "--ckpt-format": "fsdp_dtensor",
+        "--no-strict-fsdp-dtensor-load": true
+      },
+      "expected": {
+        "config.ddp": {
+          "fields.megatron_fsdp_version": 2,
+          "fields.nccl_ub": true,
+          "fields.fsdp_manual_registration": true
+        }
+      },
+      "environment": {
+        "CUDA_DEVICE_MAX_CONNECTIONS": "32"
+      },
+      "coverage_note": "Config/validation only, not FSDP or userbuffer construction."
+    },
+    {
+      "name": "coverage_fsdp2_reshard_config",
+      "tier": "builder",
+      "options": {
+        "--use-torch-fsdp2": true,
+        "--torch-fsdp2-no-reshard-after-forward": true,
+        "--no-gradient-accumulation-fusion": true,
+        "--untie-embeddings-and-output-weights": true
+      },
+      "expected": {
+        "config.ddp": {"fields.reshard_after_forward": false},
+        "config.dist": {
+          "fields.use_torch_fsdp2": true
+        }
+      },
+      "environment": {
+        "CUDA_DEVICE_MAX_CONNECTIONS": "32"
+      },
+      "coverage_note": "Config/validation only, including the derived FSDP2 reshard policy; actual FSDP execution remains untested."
+    },
+    {
+      "name": "coverage_dataset_workers_cyclic",
+      "tier": "runtime",
+      "options": {
+        "--num-workers": "1",
+        "--dataloader-type": "cyclic",
+        "--no-data-sharding": true,
+        "--train-iters": "2"
+      },
+      "expected": {
+        "consumer.dataloader": {
+          "num_workers": 1,
+          "persistent_workers": true
+        },
+        "consumer.MegatronPretrainingRandomSampler": {
+          "data_sharding": false
+        }
+      }
+    },
+    {
+      "name": "coverage_dataset_cache_config",
+      "tier": "builder",
+      "options": {
+        "--dataloader-defer-npy-index-mmap": true,
+        "--dataloader-fast-cache-load": true,
+        "--no-mmap-bin-files": true,
+        "--object-storage-cache-path": "{run}/object-cache",
+        "--num-dataset-builder-threads": "2",
+        "--mid-level-dataset-surplus": "0.02",
+        "--allow-ambiguous-pad-tokens": true
+      },
+      "expected": {
+        "consumer.dataset": {
+          "fields.defer_npy_index_mmap": true,
+          "fields.fast_cache_load": true,
+          "fields.mmap_bin_files": false,
+          "fields.object_storage_cache_path": "<run>/object-cache",
+          "fields.num_dataset_builder_threads": 2,
+          "fields.mid_level_dataset_surplus": 0.02,
+          "fields.allow_ambiguous_pad_tokens": true
+        }
+      },
+      "coverage_note": "Config only with mock data; no cache-file reuse, object-storage I/O, or mmap behavior claim."
+    },
+    {
+      "name": "coverage_dataset_masks_runtime",
+      "tier": "runtime",
+      "options": {
+        "--reset-position-ids": true,
+        "--eod-mask-loss": true,
+        "--no-create-attention-mask-in-dataloader": true,
+        "--train-iters": "2"
+      },
+      "expected": {
+        "consumer.dataset": {
+          "fields.reset_position_ids": true,
+          "fields.eod_mask_loss": true,
+          "fields.create_attention_mask": false
+        }
+      }
+    },
+    {
+      "name": "coverage_dataset_inter_document_config",
+      "tier": "builder",
+      "options": {
+        "--dataloader-inter-document-masking": true,
+        "--reset-position-ids": true,
+        "--no-create-attention-mask-in-dataloader": true
+      },
+      "expected": {
+        "consumer.dataset": {
+          "fields.inter_document_masking": true,
+          "fields.create_attention_mask": false
+        }
+      },
+      "coverage_note": "Config only, not packed-kernel execution."
+    },
+    {
+      "name": "coverage_dataset_fim_config",
+      "tier": "builder",
+      "options": {
+        "--mock-data": false,
+        "--data-path": "{fixtures}/fim-data",
+        "--fim-data": true,
+        "--fim-rate": "0.75",
+        "--fim-spm-rate": "0.25",
+        "--fim-split-sample": "t4",
+        "--fim-fragment-rate": "0.5",
+        "--fim-no-prefix": "t5",
+        "--fim-prefix-token": "t6",
+        "--fim-middle-token": "t7",
+        "--fim-suffix-token": "t8",
+        "--fim-pad-token": "[PAD]",
+        "--fim-eod-token": "[EOS]",
+        "--tokenizer-type": "HuggingFaceTokenizer",
+        "--tokenizer-model": "{fixtures}/tokenizer"
+      },
+      "expected": {
+        "consumer.dataset": {
+          "fields.fim_rate": 0.75,
+          "fields.fim_spm_rate": 0.25,
+          "fields.fim_split_sample": "t4",
+          "fields.fim_fragment_rate": 0.5,
+          "fields.fim_no_prefix": "t5",
+          "fields.fim_extra_tokens": {
+            "prefix": "t6",
+            "middle": "t7",
+            "suffix": "t8",
+            "pad": "[PAD]",
+            "eod": "[EOS]"
+          }
+        }
+      },
+      "coverage_note": "FIM config capture only with a symbolic indexed-data prefix. No file loading or FIM augmentation is executed."
+    },
+    {
+      "name": "coverage_logger_local_controls",
+      "tier": "runtime",
+      "options": {
+        "--tensorboard-dir": "{run}/tensorboard",
+        "--no-log-loss-scale-to-tensorboard": true,
+        "--log-device-memory-used": true,
+        "--logging-level": "20",
+        "--timing-log-level": "1",
+        "--timing-log-option": "max",
+        "--log-progress": true,
+        "--save": "{run}/checkpoint",
+        "--save-interval": "2",
+        "--exit-interval": "2"
+      },
+      "expected": {
+        "config.logger": {
+          "fields.log_loss_scale_to_tensorboard": false,
+          "fields.log_device_memory_used": true,
+          "fields.logging_level": 20,
+          "fields.log_progress": true
+        }
+      },
+      "required": [
+        "consumer.tensorboard",
+        "consumer.timers"
+      ]
+    },
+    {
+      "name": "coverage_logger_disabled_service_metadata",
+      "tier": "builder",
+      "options": {
+        "--one-logger-project": "seam-test",
+        "--one-logger-run-name": "offline-metadata",
+        "--one-logger-async": true,
+        "--app-tag-run-name": "seam-run",
+        "--app-tag-run-version": "1.2.3",
+        "--wandb-exp-name": "offline-metadata",
+        "--wandb-save-dir": "{run}/wandb",
+        "--wandb-entity": "seam-test"
+      },
+      "expected": {
+        "config.logger": {
+          "fields.enable_one_logger": false,
+          "fields.one_logger_project": "seam-test",
+          "fields.one_logger_run_name": "offline-metadata",
+          "fields.one_logger_async": true,
+          "fields.app_tag_run_name": "seam-run",
+          "fields.app_tag_run_version": "1.2.3",
+          "fields.wandb_exp_name": "offline-metadata",
+          "fields.wandb_save_dir": "<run>/wandb",
+          "fields.wandb_entity": "seam-test"
+        }
+      },
+      "coverage_note": "Dormant metadata only: one-logger disabled, W&B project unset, OTel disabled. No external-service coverage claimed."
+    },
+    {
+      "name": "coverage_logger_moe_trace",
+      "tier": "runtime",
+      "options": {
+        "--num-experts": "4",
+        "--moe-router-topk": "2",
+        "--moe-token-dispatcher-type": "alltoall",
+        "--moe-grouped-gemm": true,
+        "--disable-bias-linear": true,
+        "--moe-routing-trace-path": "{run}/routing",
+        "--moe-routing-trace-max-training-iters": "1",
+        "--moe-routing-trace-capture-logits": true,
+        "--moe-routing-trace-capture-hidden-states": true,
+        "--moe-routing-trace-dump-weights": true,
+        "--train-iters": "2"
+      },
+      "expected": {
+        "config.logger": {
+          "fields.moe_routing_trace_path": "<run>/routing",
+          "fields.moe_routing_trace_max_training_iters": 1,
+          "fields.moe_routing_trace_capture_logits": true,
+          "fields.moe_routing_trace_capture_hidden_states": true,
+          "fields.moe_routing_trace_dump_weights": true
+        }
+      },
+      "coverage_note": "Existing tiny MoE topology is only a prerequisite for logger coverage."
+    },
+    {
+      "name": "coverage_checkpoint_async_worker",
+      "tier": "runtime",
+      "options": {
+        "--save": "{run}/checkpoint",
+        "--save-interval": "1",
+        "--exit-interval": "2",
+        "--async-save": true,
+        "--async-strategy": "nvrx",
+        "--use-persistent-ckpt-worker": true,
+        "--async-ckpt-cpu-priority": "12",
+        "--async-ckpt-io-priority": "3",
+        "--async-ckpt-use-cpu-shm": true,
+        "--ckpt-assume-constant-structure": true
+      },
+      "expected": {
+        "config.checkpoint": {
+          "fields.async_save": true,
+          "fields.use_persistent_ckpt_worker": true,
+          "fields.async_ckpt_cpu_priority": 12,
+          "fields.async_ckpt_use_cpu_shm": true,
+          "fields.ckpt_assume_constant_structure": true
+        }
+      },
+      "coverage_note": "Requires the matching nvidia-resiliency-ext async implementation. Save-hook completion alone does not prove durable async completion."
+    },
+    {
+      "name": "coverage_checkpoint_integrity_seed",
+      "tier": "runtime",
+      "options": {
+        "--save": "{run}/checkpoint",
+        "--save-interval": "2",
+        "--exit-interval": "2",
+        "--verify-integrity": true,
+        "--no-save-tokenizer-assets": true
+      },
+      "expected": {
+        "config.checkpoint": {
+          "fields.verify_integrity": true,
+          "fields.save_tokenizer_assets": false
+        }
+      }
+    },
+    {
+      "name": "coverage_checkpoint_integrity_resume",
+      "tier": "runtime",
+      "options": {
+        "--load": "{checkpoint}",
+        "--verify-integrity": true,
+        "--auto-detect-ckpt-format": true,
+        "--ckpt-step": "2",
+        "--dist-ckpt-strictness": "raise_all",
+        "--no-use-tokenizer-model-from-checkpoint-args": true
+      },
+      "expected": {
+        "config.checkpoint": {
+          "fields.verify_integrity": true,
+          "fields.auto_detect_ckpt_format": true,
+          "fields.ckpt_step": 2,
+          "fields.dist_ckpt_strictness": "raise_all",
+          "fields.use_tokenizer_model_from_checkpoint_args": false
+        }
+      },
+      "needs_checkpoint": true,
+      "checkpoint_seed_case": "coverage_checkpoint_integrity_seed"
+    },
+    {
+      "name": "coverage_checkpoint_parallel_load",
+      "tier": "runtime",
+      "options": {
+        "--load": "{checkpoint}",
+        "--ckpt-fully-parallel-load": true,
+        "--ckpt-fully-parallel-load-exchange-algo": "gather_rounds",
+        "--ckpt-fully-parallel-load-per-rank-objects": true,
+        "--ckpt-fully-parallel-load-process-group": "ep_dp",
+        "--use-mp-args-from-checkpoint-args": true,
+        "--use-checkpoint-args": true
+      },
+      "expected": {
+        "config.checkpoint": {
+          "fields.fully_parallel_load": true,
+          "fields.ckpt_fully_parallel_load_exchange_algo": "gather_rounds",
+          "fields.ckpt_fully_parallel_load_per_rank_objects": true,
+          "fields.ckpt_fully_parallel_load_process_group": "ep_dp"
+        }
+      },
+      "ranks": 2,
+      "needs_checkpoint": true,
+      "checkpoint_seed_case": "rng_dp_fresh"
+    },
+    {
+      "name": "coverage_checkpoint_optimizer_reshard",
+      "tier": "runtime",
+      "options": {
+        "--use-distributed-optimizer": true,
+        "--dist-ckpt-optim-fully-reshardable": true,
+        "--distrib-optim-fully-reshardable-mem-efficient": true,
+        "--save": "{run}/checkpoint",
+        "--save-interval": "2",
+        "--exit-interval": "2",
+        "--ckpt-fully-parallel-save-process-group": "ep_dp"
+      },
+      "expected": {
+        "config.checkpoint": {
+          "fields.dist_ckpt_optim_fully_reshardable": true,
+          "fields.distrib_optim_fully_reshardable_mem_efficient": true,
+          "fields.ckpt_fully_parallel_save_process_group": "ep_dp"
+        }
+      },
+      "ranks": 2
+    },
+    {
+      "name": "coverage_checkpoint_nonpersistent_global",
+      "tier": "runtime",
+      "options": {
+        "--save": "{run}/checkpoint",
+        "--save-interval": "2",
+        "--exit-interval": "2",
+        "--non-persistent-ckpt-type": "global",
+        "--non-persistent-global-ckpt-dir": "{run}/nonpersistent",
+        "--non-persistent-save-interval": "1",
+        "--save-retain-interval": "2"
+      },
+      "expected": {
+        "config.checkpoint": {
+          "fields.non_persistent_ckpt_type": "global",
+          "fields.non_persistent_global_ckpt_dir": "<run>/nonpersistent",
+          "fields.non_persistent_save_interval": 1,
+          "fields.save_retain_interval": 2
+        }
+      }
+    },
+    {
+      "name": "coverage_checkpoint_save_policy",
+      "tier": "runtime",
+      "options": {
+        "--save": "{run}/checkpoint",
+        "--save-interval": "2",
+        "--exit-interval": "2",
+        "--no-ckpt-fully-parallel-save": true,
+        "--no-ckpt-load-validate-sharding-integrity": true,
+        "--no-save-optim": true,
+        "--no-save-rng": true
+      },
+      "expected": {
+        "config.checkpoint": {
+          "fields.fully_parallel_save": false,
+          "fields.ckpt_load_validate_sharding_integrity": false,
+          "fields.save_optim": false,
+          "fields.save_rng": false
+        }
+      }
+    },
+    {
+      "name": "coverage_checkpoint_pretrained_main_params",
+      "tier": "runtime",
+      "options": {
+        "--pretrained-checkpoint": "{checkpoint}",
+        "--finetune": true,
+        "--no-load-optim": true,
+        "--no-load-rng": true,
+        "--load-main-params-from-ckpt": true
+      },
+      "expected": {
+        "config.checkpoint": {
+          "fields.pretrained_checkpoint": "<checkpoint>",
+          "fields.finetune": true,
+          "fields.load_main_params_from_ckpt": true
+        }
+      },
+      "needs_checkpoint": true
+    },
+    {
+      "name": "coverage_checkpoint_cache_config",
+      "tier": "builder",
+      "options": {
+        "--load": "{checkpoint}",
+        "--ckpt-pg-tensors-cache-path": "{run}/pg-cache",
+        "--ckpt-pg-tensors-cache-create": true,
+        "--ckpt-drop-redundant-extra-state": true,
+        "--dist-ckpt-workers": "2",
+        "--ckpt-convert-format": "torch",
+        "--ckpt-convert-save": "{run}/converted",
+        "--ckpt-convert-update-legacy-dist-opt-format": true
+      },
+      "expected": {
+        "config.checkpoint": {
+          "fields.ckpt_pg_tensors_cache_path": "<run>/pg-cache",
+          "fields.ckpt_pg_tensors_cache_create": true,
+          "fields.ckpt_convert_format": "torch",
+          "fields.ckpt_convert_save": "<run>/converted",
+          "fields.ckpt_convert_update_legacy_dist_opt_format": true
+        }
+      },
+      "coverage_note": "Configuration only; no cache reuse or checkpoint conversion. CLI-only worker/drop controls need later consumer capture.",
+      "needs_checkpoint": true
+    },
+    {
+      "name": "coverage_checkpoint_debug_intervals_config",
+      "tier": "builder",
+      "options": {
+        "--save": "{run}/checkpoint",
+        "--save-interval": "2",
+        "--save-params-interval": "2",
+        "--save-activations-interval": "2",
+        "--save-wgrads-interval": "2",
+        "--save-dgrads-interval": "2",
+        "--save-tokens-per-expert-interval": "2"
+      },
+      "expected": {
+        "config.checkpoint": {
+          "fields.save_params_interval": 2,
+          "fields.save_activations_interval": 2,
+          "fields.save_wgrads_interval": 2,
+          "fields.save_dgrads_interval": 2,
+          "fields.save_tokens_per_expert_interval": 2
+        }
+      },
+      "coverage_note": "Debug-dump configuration only, no tensor/activation dump behavior claim."
+    },
+    {
+      "name": "coverage_profiling_chakra_config",
+      "tier": "builder",
+      "options": {
+        "--profile": true,
+        "--use-pytorch-profiler": true,
+        "--pytorch-profiler-collect-chakra": true,
+        "--profile-step-start": "1",
+        "--profile-step-end": "3"
+      },
+      "expected": {
+        "config.profiling": {
+          "fields.pytorch_profiler_collect_chakra": true
+        }
+      },
+      "coverage_note": "Chakra configuration only; execution requires optional Chakra dependencies."
+    },
     {
       "name": "rng_custom_seed",
       "tier": "runtime",

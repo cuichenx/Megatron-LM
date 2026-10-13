@@ -7,11 +7,18 @@ import json
 import unittest
 from dataclasses import make_dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-from compare_config_seams import compare_runs, materialize_case, validate
 from capture_config_seams import build_dataset_config
-from snapshot import LEGACY_LOGGER_FIELDS, differences, encode, logger_settings
+from compare_config_seams import (
+    compare_runs,
+    create_tp_overlap_config,
+    materialize_case,
+    validate,
+    validate_expected,
+)
+from snapshot import LEGACY_LOGGER_FIELDS, differences, dist_settings, encode, logger_settings
 
 
 class SnapshotTests(unittest.TestCase):
@@ -68,6 +75,23 @@ class SnapshotTests(unittest.TestCase):
         args = SimpleNamespace(**dict.fromkeys(LEGACY_LOGGER_FIELDS))
         self.assertTrue(differences(logger_settings(schema(1), args), logger_settings(schema(2), args)))
 
+    def test_dist_owner_schema_changes_do_not_hide_values(self):
+        legacy = make_dataclass("Dist", [("use_megatron_fsdp", bool), ("future_setting", int)])
+        native = make_dataclass("Dist", [("fake_process_group", bool), ("future_setting", int)])
+        ddp = SimpleNamespace(use_megatron_fsdp=False)
+        args = SimpleNamespace(fake_process_group=True)
+        expected = dist_settings(legacy(False, 7), ddp, args)
+        self.assertEqual(expected, dist_settings(native(True, 7), ddp, SimpleNamespace()))
+        self.assertTrue(differences(expected, dist_settings(native(False, 7), ddp, args)))
+        self.assertTrue(differences(expected, dist_settings(native(True, 8), ddp, args)))
+        with self.assertRaises(ValueError):
+            dist_settings(legacy(True, 7), ddp, args)
+        with self.assertRaises(AttributeError):
+            dist_settings(legacy(False, 7), ddp, SimpleNamespace())
+        config = native(True, 7)
+        del config.fake_process_group
+        self.assertEqual(dist_settings(config, ddp, args)["fields"]["fake_process_group"], {"missing_attribute": True})
+
     def test_changed_values(self):
         for name in ("vocab_size", "lr_decay_steps", "bucket_size"):
             with self.subTest(name=name):
@@ -87,6 +111,27 @@ class SnapshotTests(unittest.TestCase):
     def test_required_capture(self):
         self.assertTrue(validate({"schema": 1, "status": "ok", "captures": {}}, ["config.model"]))
 
+    def test_expected_values_require_one_real_matching_event(self):
+        snapshot = {"captures": {"loader": [{"workers": 0, "pin": True}, {"workers": 2, "pin": False}]}}
+        self.assertEqual(validate_expected(snapshot, {"loader": {"workers": 2, "pin": False}}), [])
+        self.assertTrue(validate_expected(snapshot, {"loader": {"workers": 2, "pin": True}}))
+        self.assertTrue(validate_expected(snapshot, {"loader": {"workers": False}}))
+        self.assertTrue(validate_expected(snapshot, {"loader": {"missing": None}}))
+        self.assertTrue(validate_expected(snapshot, {"absent": {"workers": 2}}))
+        nested = {"captures": {"config": [{"fields": {"optional": None}}]}}
+        self.assertEqual(validate_expected(nested, {"config": {"fields.optional": None}}), [])
+        checkpoint = {"captures": {"load": [{"tuple": [3, 0.0]}]}}
+        self.assertEqual(validate_expected(checkpoint, {"load": {"tuple.0": 3}}), [])
+        self.assertTrue(validate_expected(checkpoint, {"load": {"tuple.2": None}}))
+        self.assertTrue(validate_expected(checkpoint, {"load": {"tuple.-1": 0.0}}))
+
+    def test_both_sides_ignoring_a_flag_is_not_a_pass(self):
+        case = {"name": "explicit", "tier": "builder", "expected": {"config.dist": {"fields.disable_jit_fuser": True}}}
+        snapshot = {"schema": 1, "status": "ok", "case": "explicit", "rank": 0,
+                    "environment": {}, "captures": {"config.dist": [{"fields": {"disable_jit_fuser": False}}]}}
+        run = {"exit": 0, "snapshots": [snapshot]}
+        self.assertEqual(compare_runs(case, run, run, ["config.dist"])["status"], "error")
+
     def test_manifest_sources_and_arguments(self):
         manifest = json.loads(Path(__file__).with_name("cases.json").read_text())
         names = [case["name"] for case in manifest["cases"]]
@@ -96,7 +141,7 @@ class SnapshotTests(unittest.TestCase):
                 if "source" in case:
                     self.assertIn(case["source"], manifest["sources"])
                     self.assertIn(case["source"].split("-")[0], manifest["source_revisions"])
-                self.assertIn(case["tier"], ("builder", "runtime"))
+                self.assertIn(case["tier"], ("builder", "runtime", "startup"))
                 self.assertGreater(case.get("ranks", 1), 0)
                 self.assertTrue(all(isinstance(item, str) for item in materialize_case(manifest, case)["argv"]))
 
@@ -104,12 +149,41 @@ class SnapshotTests(unittest.TestCase):
         snapshot = {"schema": 1, "status": "ok", "captures": {"consumer.model": [{}]}}
         self.assertTrue(validate(snapshot, ["consumer.model", "consumer.vlm_freeze"]))
 
+    def test_expansion_cases_have_nonempty_expected_values(self):
+        manifest = json.loads(Path(__file__).with_name("cases.json").read_text())
+        self.assertIn("config.dist", manifest["required"])
+        for case in manifest["cases"]:
+            if case["name"].startswith("coverage_"):
+                with self.subTest(case=case["name"]):
+                    self.assertTrue(case["expected"])
+                    for seam, paths in case["expected"].items():
+                        self.assertTrue(seam)
+                        self.assertTrue(paths)
+                        self.assertTrue(all(path and all(path.split(".")) for path in paths))
+
     def test_case_environment_is_bounded(self):
         manifest = {"common": {}}
         case = {"options": {}, "environment": {"CUDA_DEVICE_MAX_CONNECTIONS": "32"}}
         self.assertEqual(materialize_case(manifest, case)["environment"], case["environment"])
         with self.assertRaises(ValueError):
             materialize_case(manifest, case | {"environment": {"PYTHONPATH": "/another/checkout"}})
+
+    def test_optional_probe_tiers(self):
+        for probe, allowed, denied in (("build_inference_config", "builder", "runtime"),
+                                       ("observe_tp_overlap", "runtime", "builder")):
+            case = {"tier": allowed, "options": {}, probe: True}
+            self.assertEqual(materialize_case({"common": {}}, case)["argv"], [])
+            with self.assertRaises(ValueError):
+                materialize_case({"common": {}}, case | {"tier": denied})
+
+    def test_tp_overlap_fixture_contains_distinct_operation_policies(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "overlap.json"
+            create_tp_overlap_config(path)
+            self.assertEqual(json.loads(path.read_text()), {
+                "qkv_fprop": {"method": "ring_exchange", "aggregate": 1},
+                "fc1_fprop": {"method": "ring_exchange", "aggregate": 0},
+            })
 
     def test_named_parameter_references(self):
         first, second = object(), object()

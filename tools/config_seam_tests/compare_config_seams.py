@@ -24,6 +24,12 @@ def git(repo: Path, *args: str) -> str:
 
 def materialize_case(manifest: dict, case: dict) -> dict:
     """Expand a case's explicit CLI overrides without duplicating MLM derivation."""
+    if case.get("tier") == "startup" and case.get("entrypoint") != "examples/multimodal/train.py":
+        raise ValueError("Startup capture currently supports the real multimodal entrypoint only")
+    if case.get("build_inference_config") and case.get("tier") != "builder":
+        raise ValueError("Inference config probes must use the builder tier")
+    if case.get("observe_tp_overlap") and case.get("tier") != "runtime":
+        raise ValueError("TP overlap consumer probes must use the runtime tier")
     for name, value in case.get("environment", {}).items():
         if name != "CUDA_DEVICE_MAX_CONNECTIONS" or not isinstance(value, str):
             raise ValueError(f"Unsupported case environment override: {name}")
@@ -46,6 +52,37 @@ def validate(snapshot: dict, required: list[str]) -> list[str]:
     for name in required:
         if not snapshot.get("captures", {}).get(name):
             errors.append("missing capture: " + name)
+    return errors
+
+
+def validate_expected(snapshot: dict, expected: dict) -> list[str]:
+    """Require a matching observed event, independently of before/after equality.
+
+    Paths address dictionaries or list indices within one capture event (for
+    example ``fields.eval_micro_batch_size`` or ``tuple.0``). All expectations for a seam must match
+    the same event. Missing values never count as explicit null values.
+    """
+    errors = []
+    missing = object()
+
+    def matches(event, paths):
+        for path, wanted in paths.items():
+            actual = event
+            for key in path.split("."):
+                if isinstance(actual, dict):
+                    actual = actual.get(key, missing)
+                elif isinstance(actual, list) and key.isdecimal() and int(key) < len(actual):
+                    actual = actual[int(key)]
+                else:
+                    actual = missing
+            if actual is missing or differences(actual, wanted):
+                return False
+        return True
+
+    for seam, paths in expected.items():
+        events = snapshot.get("captures", {}).get(seam, [])
+        if not any(matches(event, paths) for event in events):
+            errors.append(f"expected consumer/config values not observed: {seam}: {paths}")
     return errors
 
 
@@ -135,6 +172,7 @@ def compare_runs(case: dict, baseline: dict, candidate: dict, required: list[str
             errors.append(f"process exit: {run['exit']}")
         for rank, snapshot in enumerate(run["snapshots"]):
             errors.extend(f"rank {rank}: {item}" for item in validate(snapshot, required))
+            errors.extend(f"rank {rank}: {item}" for item in validate_expected(snapshot, case.get("expected", {})))
             if snapshot.get("status") != "ok" and snapshot.get("error"):
                 errors.append(f"rank {rank}: {snapshot['error']}")
             if snapshot.get("rank") != rank or snapshot.get("case") != case["name"]:
@@ -155,7 +193,7 @@ def compare_runs(case: dict, baseline: dict, candidate: dict, required: list[str
 def create_tokenizer(destination: Path) -> None:
     """Create a deterministic local 261-token HF fixture; no network/model downloads."""
     from tokenizers import Tokenizer, models, pre_tokenizers
-    from transformers import PreTrainedTokenizerFast
+    from transformers import BertTokenizer, PreTrainedTokenizerFast
 
     vocabulary = {"[UNK]": 0, "[PAD]": 1, "[BOS]": 2, "[EOS]": 3}
     vocabulary.update({f"t{index}": index for index in range(4, 261)})
@@ -164,6 +202,31 @@ def create_tokenizer(destination: Path) -> None:
     PreTrainedTokenizerFast(
         tokenizer_object=tokenizer, unk_token="[UNK]", pad_token="[PAD]", bos_token="[BOS]", eos_token="[EOS]"
     ).save_pretrained(destination)
+    # A separate WordPiece vocabulary exercises vocab_file without downloading
+    # a model or changing the existing HF tokenizer vocabulary.
+    wordpiece = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", *[f"t{i}" for i in range(256)]]
+    vocab_file = destination / "bert-vocab.txt"
+    vocab_file.write_text("\n".join(wordpiece) + "\n")
+    # vocab_file alone does not provide AutoTokenizer's class metadata. Supply
+    # a local BERT tokenizer rather than relying on a cached Hub identifier.
+    # Transformers 4 reads vocab_file; Transformers 5 accepts the vocabulary.
+    BertTokenizer(
+        vocab_file=str(vocab_file), vocab={token: index for index, token in enumerate(wordpiece)}
+    ).save_pretrained(destination / "bert")
+
+
+def create_tp_overlap_config(destination: Path) -> None:
+    """Create a small offline TE override fixture, using JSON's YAML-compatible syntax.
+
+    The operation names/methods follow MLM's pinned functional overlap recipe.
+    Keep all other operations at TE defaults rather than prescribing SM counts
+    for a different GPU or copying the recipe's large-model tuning.
+    """
+    config = {
+        "qkv_fprop": {"method": "ring_exchange", "aggregate": 1},
+        "fc1_fprop": {"method": "ring_exchange", "aggregate": 0},
+    }
+    destination.write_text(json.dumps(config, indent=2) + "\n")
 
 
 def main() -> None:
@@ -211,6 +274,7 @@ def main() -> None:
     options.output.mkdir(parents=True, exist_ok=False)
     fixtures = options.output / "fixtures"
     create_tokenizer(fixtures / "tokenizer")
+    create_tp_overlap_config(fixtures / "tp_overlap.json")
     provenance["fixtures"] = {
         str(p.relative_to(fixtures)): hashlib.sha256(p.read_bytes()).hexdigest()
         for p in fixtures.rglob("*")
@@ -265,13 +329,18 @@ def main() -> None:
                 for label in ("baseline", "candidate")
             }
             required = [*manifest["required"], *case.get("required", [])]
+            if case["tier"] == "startup":
+                # Stop at pretrain only after real imports and runtime setup.
+                # No Energon data loading, model construction, or training claim.
+                required = [name for name in required if name not in ("consumer.dataset", "consumer.scheduler")]
+                required += ["startup.entrypoint"]
             if case["tier"] == "runtime":
                 required += ["consumer.model", "consumer.ddp", "consumer.optimizer", "consumer.rng_seed", "runtime.rng_after_seed"]
                 if "--save" in case["argv"]:
                     required += ["runtime.checkpoint_save", "runtime.rng_at_save"]
                 if case.get("needs_checkpoint"):
                     required += ["runtime.checkpoint_load", "runtime.rng_after_load"]
-            else:
+            elif case["tier"] == "builder":
                 required += ["builder.scheduler_points", "builder.batch_points"]
             report["results"].append(compare_runs(case, runs["baseline"], runs["candidate"], required))
         LOGGER.info("%s: %s", case["name"], report["results"][-1]["status"])

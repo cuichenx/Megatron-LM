@@ -5,6 +5,13 @@ objects and resolved inputs across a representative CLI matrix. It is **not part
 PR7418 or the config-ownership PRs**, does not modify either tested checkout,
 and does not need to land in MLM main.
 
+The coverage expansion adds 58 `coverage_*` scenarios and expected-value
+assertions. Together with the retained Hybrid TE-tracker case and real multimodal
+startup case, the manifest has 112 cases. See [the expansion inventory](EXPANSION.md)
+for scope and historical input counts, and [the PR7778 report](DIST_RESULTS.md)
+for validation results and limitations. Earlier result documents still describe
+their original pinned harness revisions.
+
 ## Run
 
 Use the same supported MLM development environment for both revisions (Python 3.12,
@@ -19,8 +26,8 @@ worktrees at exact commits, then run from this directory:
 uv run --no-sync python compare_config_seams.py \
   --baseline /path/to/main-worktree \
   --candidate /path/to/pr-worktree \
-  --baseline-revision d564dd01de4549a4884be26b1d74e169798fd877 \
-  --candidate-revision f0148a3600818588406d8ca6437a8de1f8377f38 \
+  --baseline-revision 3bb482c487cd447a2b40a3bf076ab14cad514e13 \
+  --candidate-revision f994dea1253eae06852057ac93ce8042e9531bbe \
   --environment-id YOUR_CONTAINER_REFERENCE_OR_DIGEST \
   --output /path/to/new-result-directory \
   --cases defaults known_padded known_unpadded hf_derived hf_unpadded
@@ -97,7 +104,8 @@ difference rather than suppressing it. This suite runs capture/compare cases
 only, not product unit tests or harness self-tests.
 
 `capture_config_seams.py` runs the checkout's actual `pretrain_gpt.py` (or
-`pretrain_hybrid.py` for Hybrid builder cases, or `pretrain_vlm.py` for the VLM case) as `__main__`.
+`pretrain_hybrid.py` for Hybrid builder cases, `pretrain_vlm.py` for mock-data VLM
+training, and `examples/multimodal/train.py` for its real startup case) as `__main__`.
 It observes its existing initialization path instead of recreating the old/new order.
 The same capture implementation is used for both revisions.
 
@@ -110,6 +118,17 @@ The same capture implementation is used for both revisions.
   save/load completion during short training runs. Every launched rank must report.
 - **CLI rejection:** a named invalid flag combination must be rejected on both sides
   with the expected validation error; this is not a successful configuration capture.
+- **Startup tier:** runs the actual multimodal script's imports, argument parsing,
+  config construction, tokenizer and runtime-service initialization, then captures
+  the call into `pretrain`. It does not substitute stub imports or claim Energon
+  data loading or multimodal training. The existing mock-data VLM runtime cases
+  remain separate. An import error is a failure, not a skipped case.
+
+The distributed-config comparison observes `fake_process_group` from its legacy
+CLI owner only when absent from the dataclass schema. The old
+`dist.use_megatron_fsdp` duplicate must agree with the separately captured DDP
+owner before it is omitted from the comparable distributed view. All other fields
+are retained; each snapshot also preserves `raw_dist_config` for inspection.
 
 All dataclass fields are encoded recursively. Tokenizers use type/vocabulary/special-ID
 descriptors; callable names, defaults and closure values are retained. Bound methods
@@ -120,6 +139,24 @@ DDP layout parameter references use model-local names, shapes, dtypes and traina
 not memory addresses or tensor values. Unregistered parameter references still fail.
 Timing and provenance are not configuration values. Missing and null, tuples and lists,
 integers and booleans remain distinct. No numeric tolerance or broad field ignore list.
+
+The expansion also records `config.dist`, configured versus running global batch
+size, and actual DataLoader/sampler constructor settings. Per-case `expected`
+assertions apply independently to **both** revisions, before equivalence is accepted.
+An expected capture must exist, and one event must satisfy all specified paths;
+matching defaults on both sides cannot mask an ignored option. Dictionary paths
+use dots; numeric components index encoded lists (e.g. `tuple.0` for checkpoint
+load's returned iteration). These assertions do not replace end-to-end feature tests.
+
+VLM cases observe language/vision freezing, resolved sequence lengths, and packed
+CP input format. TP-overlap cases observe TE userbuffer initialization, including
+the parsed fixture file and bootstrap backend, plus model-constructor policies.
+The overlap fixture uses distinct QKV/FC1 policies from the pinned MLM functional
+recipe; it leaves other operations at TE defaults. Legacy split switches are
+builder-only checks, not claims that current TE consumes deprecated controls.
+Inference cases opt into `build_inference_config`: a builder-only call to the
+checkout's real `inference_cfg_from_args` factory. They test settings and resume
+precedence, not an inference engine, generation, or server behavior.
 
 For the logging ownership migration, `config.logger` retains every native field
 and additionally observes ten formerly CLI-only one-logger/OTel/inspector settings from
@@ -144,6 +181,8 @@ tests and training/resume/convergence/performance validation, not replaces them.
 
 ## Results and extension
 
+See [the PR7778 full-matrix report](DIST_RESULTS.md) for distributed-init ownership
+and the real multimodal-entrypoint startup regression check.
 See [the PR7418 results](RESULTS.md) for the current pinned before/after comparison.
 See [the profiling ownership results](PROFILING_RESULTS.md) for the separate C01 pilot.
 Earlier results remain available in Git history.
