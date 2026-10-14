@@ -7,6 +7,11 @@ against frozen main `3bb482c48` and PR head `f994dea12`. The parameter-input
 inventory below remains the historical 2026-09-23 source audit, not a fresh
 spreadsheet audit or a behavior-coverage percentage.
 
+The subsequent training/validation comparison adds `coverage_model_test_mode`
+(113 current cases), checking the enabled model-owned flag after its redundant
+ValidationConfig field is removed. This does not change the historical PR7778
+result or the parameter-input counts below.
+
 ## Status and scope
 
 Requested 2026-09-23. The isolated harness-only draft started from fork harness

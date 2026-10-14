@@ -14,7 +14,7 @@ import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
-from snapshot import dist_settings, encode, logger_settings
+from snapshot import dist_settings, encode, logger_settings, validation_settings
 
 
 def build_dataset_config(dataset_provider, args):
@@ -140,6 +140,10 @@ def main() -> None:
         def entry(cfg, dataset_provider, *args, **kwargs):
             cli = globals_.get_args()
             record("config.model", cfg.model)
+            # Legacy VLM callbacks construct their TransformerConfig later from
+            # args. Native model containers already hold the authoritative input.
+            model_inputs = cfg.model.transformer if cfg.model is not None else cli
+            record("runtime.model_test_mode", model_inputs.test_mode)
             for field in (
                 "optimizer",
                 "ddp",
@@ -160,6 +164,9 @@ def main() -> None:
                 elif field == "dist":
                     result["raw_dist_config"] = encode(value, roots)
                     value = dist_settings(value, cfg.ddp, cli)
+                elif field == "validation":
+                    result["raw_validation_config"] = encode(value, roots)
+                    value = validation_settings(value, model_inputs)
                 record("config." + field, value)
             record(
                 "runtime.services",

@@ -18,7 +18,14 @@ from compare_config_seams import (
     validate,
     validate_expected,
 )
-from snapshot import LEGACY_LOGGER_FIELDS, differences, dist_settings, encode, logger_settings
+from snapshot import (
+    LEGACY_LOGGER_FIELDS,
+    differences,
+    dist_settings,
+    encode,
+    logger_settings,
+    validation_settings,
+)
 
 
 class SnapshotTests(unittest.TestCase):
@@ -74,6 +81,23 @@ class SnapshotTests(unittest.TestCase):
         schema = make_dataclass("LoggerConfig", [("future_setting", int)])
         args = SimpleNamespace(**dict.fromkeys(LEGACY_LOGGER_FIELDS))
         self.assertTrue(differences(logger_settings(schema(1), args), logger_settings(schema(2), args)))
+
+    def test_validation_duplicate_removal_requires_model_agreement(self):
+        legacy = make_dataclass("Validation", [("test_mode", bool), ("eval_iters", int)])
+        native = make_dataclass("Validation", [("eval_iters", int)])
+        for enabled in (False, True):
+            model = SimpleNamespace(test_mode=enabled)
+            expected = validation_settings(legacy(enabled, 7), model)
+            self.assertEqual(expected, validation_settings(native(7), model))
+            self.assertTrue(differences(expected, validation_settings(native(8), model)))
+            with self.assertRaises(ValueError):
+                validation_settings(legacy(not enabled, 7), model)
+            with self.assertRaises(ValueError):
+                validation_settings(legacy(int(enabled), 7), model)
+            with self.assertRaises(AttributeError):
+                validation_settings(legacy(enabled, 7), SimpleNamespace())
+        future = make_dataclass("Validation", [("eval_iters", int), ("future_setting", int)])
+        self.assertTrue(differences(validation_settings(future(7, 1), model), validation_settings(future(7, 2), model)))
 
     def test_dist_owner_schema_changes_do_not_hide_values(self):
         legacy = make_dataclass("Dist", [("use_megatron_fsdp", bool), ("future_setting", int)])

@@ -606,6 +606,18 @@
       "coverage_note": "Current-run constructor inputs plus checkpoint-selected scheduler restoration; no --use-checkpoint-args. Keep max/min LR equal to the seed because optimizer checkpoint group keys include those values; vary decay style instead."
     },
     {
+      "name": "coverage_model_test_mode",
+      "tier": "builder",
+      "options": {
+        "--test-mode": true
+      },
+      "expected": {
+        "config.model": {
+          "fields.transformer.fields.test_mode": true
+        }
+      }
+    },
+    {
       "name": "coverage_validation_batches",
       "tier": "runtime",
       "options": {

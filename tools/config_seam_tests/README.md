@@ -7,10 +7,12 @@ and does not need to land in MLM main.
 
 The coverage expansion adds 58 `coverage_*` scenarios and expected-value
 assertions. Together with the retained Hybrid TE-tracker case and real multimodal
-startup case, the manifest has 112 cases. See [the expansion inventory](EXPANSION.md)
-for scope and historical input counts, and [the PR7778 report](DIST_RESULTS.md)
-for validation results and limitations. Earlier result documents still describe
-their original pinned harness revisions.
+startup case, the PR7778 matrix has 112 cases. A subsequent `--test-mode` builder
+case brings the current manifest to 113 cases. See [the expansion inventory](EXPANSION.md)
+for scope and historical input counts, [the PR8149 report](TRAIN_VALIDATION_RESULTS.md)
+for the current training/validation comparison, and [the PR7778 report](DIST_RESULTS.md)
+for the earlier distributed-config comparison. Earlier result documents still
+describe their original pinned harness revisions.
 
 ## Run
 
@@ -129,6 +131,16 @@ CLI owner only when absent from the dataclass schema. The old
 `dist.use_megatron_fsdp` duplicate must agree with the separately captured DDP
 owner before it is omitted from the comparable distributed view. All other fields
 are retained; each snapshot also preserves `raw_dist_config` for inspection.
+
+For training/validation ownership, the removed `ValidationConfig.test_mode`
+duplicate must agree with its separately captured model input before omission
+from the comparable validation view. Native containers supply that input from
+`cfg.model.transformer`; legacy VLM entrypoints have no model container yet and
+their callbacks construct the transformer config from CLI inputs. Both retain
+the observed value as `runtime.model_test_mode` and the original validation
+schema as `raw_validation_config`. The `coverage_model_test_mode` builder case
+checks the enabled flag, including its model-config value. Other validation
+fields, missing values and unknown fields remain strict comparisons.
 
 All dataclass fields are encoded recursively. Tokenizers use type/vocabulary/special-ID
 descriptors; callable names, defaults and closure values are retained. Bound methods

@@ -65,6 +65,18 @@ def dist_settings(config: Any, ddp: Any, args: Any) -> dict:
     return {"type": qualified_name(type(config)), "fields": values}
 
 
+def validation_settings(config: Any, transformer: Any) -> dict:
+    """Retain validation fields and verify the removed model-owned test_mode duplicate."""
+    values = {
+        field.name: getattr(config, field.name, {"missing_attribute": True})
+        for field in dataclasses.fields(config)
+    }
+    if "test_mode" in values:
+        if differences(values.pop("test_mode"), transformer.test_mode):
+            raise ValueError("Legacy validation/model test_mode values disagree")
+    return {"type": qualified_name(type(config)), "fields": values}
+
+
 def encode(value: Any, roots: dict[str, str] | None = None, references: dict[int, dict] | None = None) -> Any:
     """Encode supported semantic values; reject unsupported objects, never use repr."""
     roots = roots or {}
