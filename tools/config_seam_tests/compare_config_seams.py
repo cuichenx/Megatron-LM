@@ -86,6 +86,38 @@ def validate_expected(snapshot: dict, expected: dict) -> list[str]:
     return errors
 
 
+def validate_replay(snapshot: dict) -> list[str]:
+    """Check original/replayed batch equality for the single-iterator replay probe.
+
+    Each contiguous replay block must repeat the immediately preceding equally
+    sized block of original reads. This intentionally does not claim coverage of
+    interleaved/multi-iterator pipeline replay.
+    """
+    events = snapshot.get("captures", {}).get("runtime.rerun_batches", [])
+    errors = []
+    replay_count = 0
+    index = 0
+    while index < len(events):
+        if events[index].get("replaying") is not True:
+            index += 1
+            continue
+        start = index
+        while index < len(events) and events[index].get("replaying") is True:
+            index += 1
+        count = index - start
+        replay_count += count
+        originals = events[max(0, start - count):start]
+        if len(originals) != count or any(event.get("replaying") is not False for event in originals):
+            errors.append(f"replay block at {start} has no matching original block")
+            continue
+        for original, replay in zip(originals, events[start:index]):
+            if not original.get("batch") or not replay.get("batch") or differences(original["batch"], replay["batch"]):
+                errors.append(f"replay block at {start} changed or omitted original batch content")
+    if not replay_count:
+        errors.append("no replayed batches observed")
+    return errors
+
+
 def run_case(repo: Path, case: dict, destination: Path, fixtures: Path, checkpoint: Path, timeout: int) -> dict:
     """Run an isolated process group and terminate the entire group on timeout."""
     destination.mkdir(parents=True)
@@ -173,6 +205,8 @@ def compare_runs(case: dict, baseline: dict, candidate: dict, required: list[str
         for rank, snapshot in enumerate(run["snapshots"]):
             errors.extend(f"rank {rank}: {item}" for item in validate(snapshot, required))
             errors.extend(f"rank {rank}: {item}" for item in validate_expected(snapshot, case.get("expected", {})))
+            if case.get("verify_replay"):
+                errors.extend(f"rank {rank}: {item}" for item in validate_replay(snapshot))
             if snapshot.get("status") != "ok" and snapshot.get("error"):
                 errors.append(f"rank {rank}: {snapshot['error']}")
             if snapshot.get("rank") != rank or snapshot.get("case") != case["name"]:
@@ -336,6 +370,7 @@ def main() -> None:
                 required += ["startup.entrypoint"]
             if case["tier"] == "runtime":
                 required += ["consumer.model", "consumer.ddp", "consumer.optimizer", "consumer.rng_seed", "runtime.rng_after_seed"]
+                required += ["runtime.rerun_inputs", "runtime.rerun_steps", "runtime.training_metrics"]
                 if "--save" in case["argv"]:
                     required += ["runtime.checkpoint_save", "runtime.rng_at_save"]
                 if case.get("needs_checkpoint"):

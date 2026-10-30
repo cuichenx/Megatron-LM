@@ -60,6 +60,8 @@
     "config.validation",
     "config.profiling",
     "config.rng",
+    "config.rerun_state_machine",
+    "config.straggler",
     "runtime.microbatch_inputs",
     "runtime.tokenizer_inputs",
     "runtime.tokenizer",
@@ -69,6 +71,40 @@
     "consumer.scheduler"
   ],
   "cases": [
+    {
+      "name": "rerun_replay",
+      "verify_replay": true,
+      "tier": "runtime",
+      "required": ["runtime.rerun_inputs", "runtime.rerun_steps", "runtime.rerun_batches", "runtime.training_metrics"],
+      "options": {
+        "--error-injection-rate": "1",
+        "--error-injection-type": "transient_error",
+        "--no-check-for-nan-in-loss-and-grad": true,
+        "--check-for-spiky-loss": true
+      },
+      "expected": {
+        "runtime.rerun_batches": {"replaying": true},
+        "runtime.rerun_steps": {"state.name": "RERUNNING_IN_PLACE", "run": true},
+        "runtime.training_metrics": {"iteration": 4}
+      }
+    },
+    {
+      "name": "straggler_enabled",
+      "tier": "runtime",
+      "required": ["runtime.straggler_inputs", "runtime.straggler_report", "runtime.training_metrics"],
+      "options": {"--log-straggler": true, "--straggler-ctrlr-port": "0", "--log-interval": "2"},
+      "expected": {
+        "runtime.straggler_inputs": {"enabled": true, "port": 0, "world": 1, "rank": 0},
+        "runtime.straggler_report": {"log_interval": 2}
+      }
+    },
+    {
+      "name": "straggler_start_disabled",
+      "tier": "runtime",
+      "required": ["runtime.straggler_inputs", "runtime.straggler_report", "runtime.training_metrics"],
+      "options": {"--log-straggler": true, "--disable-straggler-on-startup": true, "--straggler-ctrlr-port": "0"},
+      "expected": {"runtime.straggler_inputs": {"enabled": false, "port": 0}}
+    },
     {
       "name": "multimodal_train_startup",
       "tier": "startup",

@@ -191,7 +191,34 @@ audit of every downstream consumer. Constructor input equality does not prove co
 model/process-group/control-flow equivalence. This harness supplements behavioral unit
 tests and training/resume/convergence/performance validation, not replaces them.
 
+## Rerun and straggler migration
+
+This branch updates the observation boundary for current config-first startup and
+tokenizer initialization. It adds `config.rerun_state_machine`, `config.straggler`,
+actual rerun-engine and straggler-detector inputs, forward/replay transitions,
+batch-content hashes, and exact training loss/LR observations.
+
+Select `defaults runtime_fresh runtime_resume rerun_replay straggler_enabled
+straggler_start_disabled`. The replay case uses Core's real transient-error injector
+with nonfatal spiky-loss checking, so training must replay and continue through
+iteration four. The two detector cases exercise normal and start-disabled setup.
+Runtime comparisons require observed rerun initialization, step transitions and
+training metrics. Native/deleted-args behavior is covered separately by MLM tests,
+never run by this harness.
+
+Hashing batches and reading losses synchronizes tensors: these are correctness
+checks, not throughput or straggler-timing measurements. Resume comparisons use
+the same baseline-created checkpoint on both revisions; they do not establish
+candidate-checkpoint round-trip equivalence. Deterministic validation additionally
+requires `--deterministic-mode` in the selected manifest and recorded provenance.
+Use `rerun_deterministic_cases.json` for the focused deterministic pair. The
+single-iterator replay case also requires replayed batch hashes to equal the
+corresponding original reads within each run, independently of cross-revision parity.
+
 ## Results and extension
+
+See [the C14/C15 report](RERUN_STRAGGLER_RESULTS.md) for the focused rerun/straggler
+selection, deterministic fresh/resume comparison, commands, and coverage limits.
 
 See [the PR7778 full-matrix report](DIST_RESULTS.md) for distributed-init ownership
 and the real multimodal-entrypoint startup regression check.

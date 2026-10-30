@@ -77,6 +77,14 @@ def validation_settings(config: Any, transformer: Any) -> dict:
     return {"type": qualified_name(type(config)), "fields": values}
 
 
+def rerun_settings(config: Any, args: Any) -> dict:
+    """Observe tracker ownership without repairing native values from legacy args."""
+    values = {field.name: getattr(config, field.name) for field in dataclasses.fields(config)}
+    if "result_rejected_tracker_filename" not in values:
+        values["result_rejected_tracker_filename"] = args.result_rejected_tracker_filename
+    return values
+
+
 def encode(value: Any, roots: dict[str, str] | None = None, references: dict[int, dict] | None = None) -> Any:
     """Encode supported semantic values; reject unsupported objects, never use repr."""
     roots = roots or {}

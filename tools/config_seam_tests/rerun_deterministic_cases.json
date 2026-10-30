@@ -1,0 +1,102 @@
+{
+  "schema": 1,
+  "sources": {
+    "mlm-llama": "examples/llama/train_llama3_8b_h100_fp8.sh",
+    "mlm-fp16": "tests/functional_tests/test_cases/gpt/gpt3_mcore_tp1_pp2_fp16/model_config.yaml",
+    "mlm-moe-overlap": "tests/functional_tests/test_cases/moe/gpt3_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_1node/model_config.yaml",
+    "mlm-moe-capacity": "tests/unit_tests/transformer/moe/test_token_dispatcher.py",
+    "mlm-mamba": "examples/mamba/train.sh",
+    "mlm-selective-recompute": "tests/functional_tests/test_cases/moe/gpt3_mcore_te_tp2_pp2_ep4_etp1_selective_recompute_experimental/model_config.yaml",
+    "mlm-full-recompute": "tests/functional_tests/test_cases/gpt/gpt3_mcore_te_tp1_pp1_uniform_full_recompute/model_config.yaml",
+    "mlm-fsdp2": "tests/functional_tests/test_cases/gpt/gpt3_mcore_tp1_pp1_fsdp2_resume_torch_dist_te/model_config.yaml",
+    "mlm-vlm": "tests/functional_tests/test_cases/multimodal-llava/multimodal_llava_mcore_te_tp1_pp1/model_config.yaml",
+    "mlm-context-parallel": "tests/functional_tests/test_cases/gpt/gpt3_mcore_te_tp2_pp2_cp2_1node/model_config.yaml",
+    "mlm-interleaved": "tests/functional_tests/test_cases/gpt/gpt3_mcore_te_tp1_pp4_vp1_1node/model_config.yaml",
+    "zoo-mixtral": "model_configs/benchmarking/Mixtral-8x7B.yaml",
+    "zoo-qwen3": "model_configs/benchmarking/Qwen3-30B-A3B.yaml",
+    "zoo-deepseek": "model_configs/benchmarking/DeepSeek-V3.yaml",
+    "zoo-qwen-next": "model_configs/benchmarking/Qwen3-Next-80B-A3B.yaml"
+  },
+  "source_revisions": {
+    "mlm": {
+      "repository": "https://github.com/NVIDIA/Megatron-LM",
+      "revision": "cfa9e20d2658844dd84a07f2ccd34d7e62ab5552"
+    },
+    "zoo": {
+      "repository": "https://github.com/yanring/Megatron-MoE-ModelZoo",
+      "revision": "c2d0171e5d8c9f4da9b00bd44c05317fa20a4fcd"
+    }
+  },
+  "common": {
+    "--num-layers": "2",
+    "--hidden-size": "128",
+    "--num-attention-heads": "4",
+    "--ffn-hidden-size": "512",
+    "--seq-length": "32",
+    "--max-position-embeddings": "64",
+    "--micro-batch-size": "1",
+    "--global-batch-size": "4",
+    "--train-iters": "4",
+    "--lr-decay-iters": "4",
+    "--lr-warmup-iters": "1",
+    "--eval-iters": "1",
+    "--eval-interval": "2",
+    "--mock-data": true,
+    "--tokenizer-type": "NullTokenizer",
+    "--vocab-size": "133",
+    "--num-workers": "0",
+    "--bf16": true,
+    "--lr": "0.0001",
+    "--min-lr": "0.00001",
+    "--seed": "1234",
+    "--log-interval": "1",
+    "--no-one-logger": true,
+    "--data-cache-path": "{run}/dataset-cache",
+    "--deterministic-mode": true
+  },
+  "required": [
+    "config.model",
+    "config.optimizer",
+    "config.ddp",
+    "config.dist",
+    "config.scheduler",
+    "config.checkpoint",
+    "config.logger",
+    "config.tokenizer",
+    "config.train",
+    "config.validation",
+    "config.profiling",
+    "config.rng",
+    "config.rerun_state_machine",
+    "config.straggler",
+    "runtime.microbatch_inputs",
+    "runtime.tokenizer_inputs",
+    "runtime.tokenizer",
+    "runtime.services",
+    "runtime.batch",
+    "consumer.dataset",
+    "consumer.scheduler"
+  ],
+  "cases": [
+    {
+      "name": "runtime_fresh",
+      "tier": "runtime",
+      "options": {
+        "--save": "{run}/checkpoint",
+        "--save-interval": "2",
+        "--exit-interval": "2",
+        "--ckpt-format": "torch_dist"
+      }
+    },
+    {
+      "name": "runtime_resume",
+      "tier": "runtime",
+      "needs_checkpoint": true,
+      "options": {
+        "--load": "{checkpoint}",
+        "--use-checkpoint-args": true,
+        "--exit-on-missing-checkpoint": true
+      }
+    }
+  ]
+}

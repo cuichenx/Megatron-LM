@@ -14,7 +14,7 @@ import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
-from snapshot import dist_settings, encode, logger_settings, validation_settings
+from snapshot import dist_settings, encode, logger_settings, rerun_settings, validation_settings
 
 
 def build_dataset_config(dataset_provider, args):
@@ -103,7 +103,6 @@ def main() -> None:
         from megatron.core.distributed import DistributedDataParallel
         from megatron.core.models.gpt.gpt_model import GPTModel
         from megatron.training import training
-        from megatron.training.config import TokenizerConfig
 
         if not Path(training.__file__).resolve().is_relative_to(options.repo.resolve()):
             raise RuntimeError("Imported training code from the wrong checkout")
@@ -115,18 +114,18 @@ def main() -> None:
         }
         observe_call(globals_, "init_num_microbatches_calculator", "runtime.microbatch_inputs")
 
-        original_tokenizer = globals_.build_tokenizer
+        original_tokenizer = globals_._build_tokenizer
 
-        def tokenizer(args, **kwargs):
+        def tokenizer(cfg, args):
             record(
                 "runtime.tokenizer_inputs",
-                {f.name: getattr(args, f.name) for f in dataclasses.fields(TokenizerConfig) if hasattr(args, f.name)},
+                cfg.tokenizer,
             )
-            output = original_tokenizer(args, **kwargs)
+            output = original_tokenizer(cfg, args)
             record("runtime.tokenizer", output)
             return output
 
-        globals_.build_tokenizer = tokenizer
+        globals_._build_tokenizer = tokenizer
         observe_call(training, "OptimizerParamScheduler", "consumer.scheduler", excluded=("optimizer",))
         original_dataset_post_init = GPTDatasetConfig.__post_init__
 
@@ -137,7 +136,7 @@ def main() -> None:
         GPTDatasetConfig.__post_init__ = dataset_post_init
         original_pretrain = training.pretrain
 
-        def entry(cfg, dataset_provider, *args, **kwargs):
+        def capture_entry(cfg, dataset_provider, *args, **kwargs):
             cli = globals_.get_args()
             record("config.model", cfg.model)
             # Legacy VLM callbacks construct their TransformerConfig later from
@@ -156,6 +155,8 @@ def main() -> None:
                 "validation",
                 "profiling",
                 "rng",
+                "rerun_state_machine",
+                "straggler",
             ):
                 value = getattr(cfg, field)
                 if field == "logger":
@@ -167,6 +168,8 @@ def main() -> None:
                 elif field == "validation":
                     result["raw_validation_config"] = encode(value, roots)
                     value = validation_settings(value, model_inputs)
+                elif field == "rerun_state_machine":
+                    value = rerun_settings(value, cli)
                 record("config." + field, value)
             record(
                 "runtime.services",
@@ -184,9 +187,9 @@ def main() -> None:
                     "global": batches.get_current_global_batch_size(),
                     "running_global": batches.get_current_running_global_batch_size(),
                     "microbatches": batches.get_num_microbatches(),
-                    "resolved_global": cli.global_batch_size,
-                    "eval_global": cli.eval_global_batch_size,
-                    "eval_micro": cli.eval_micro_batch_size,
+                    "resolved_global": cfg.train.global_batch_size,
+                    "eval_global": cfg.validation.eval_global_batch_size,
+                    "eval_micro": cfg.validation.eval_micro_batch_size,
                 },
             )
             if case.get("build_inference_config"):
@@ -198,7 +201,7 @@ def main() -> None:
 
                 record("builder.inference", inference_cfg_from_args(cli))
             if case["tier"] == "runtime":
-                return original_pretrain(cfg, dataset_provider, *args, **kwargs)
+                return
             if case["tier"] == "startup":
                 record("startup.entrypoint", {"path": entrypoint, "reached_pretrain": True})
                 return
@@ -224,6 +227,42 @@ def main() -> None:
                     },
                 )
 
+        def entry(cfg, dataset_provider, *args, **kwargs):
+            # Compare the same post-runtime boundary across startup API revisions.
+            # Older entrypoints construct services before pretrain; newer ones let
+            # initialize_megatron own that work. Do not initialize services ourselves.
+            if "runtime.tokenizer" in result["captures"]:
+                capture_entry(cfg, dataset_provider, *args, **kwargs)
+                if case["tier"] == "runtime":
+                    return original_pretrain(cfg, dataset_provider, *args, **kwargs)
+                return
+
+            from megatron.training import initialize
+
+            class EntryCaptured(Exception):
+                pass
+
+            original_services = globals_.initialize_runtime_services
+            original_init_services = initialize.initialize_runtime_services
+
+            @functools.wraps(original_services)
+            def services(*service_args, **service_kwargs):
+                output = original_services(*service_args, **service_kwargs)
+                capture_entry(cfg, dataset_provider, *args, **kwargs)
+                if case["tier"] != "runtime":
+                    raise EntryCaptured
+                return output
+
+            globals_.initialize_runtime_services = services
+            initialize.initialize_runtime_services = services
+            try:
+                return original_pretrain(cfg, dataset_provider, *args, **kwargs)
+            except EntryCaptured:
+                return
+            finally:
+                globals_.initialize_runtime_services = original_services
+                initialize.initialize_runtime_services = original_init_services
+
         package.pretrain = entry
         training.pretrain = entry
         if case["tier"] == "runtime":
@@ -233,8 +272,71 @@ def main() -> None:
             from torch.utils.tensorboard import SummaryWriter
 
             from megatron.core import tensor_parallel
+            from megatron.core.rerun_state_machine import RerunDataIterator, RerunStateMachine
             from megatron.training import initialize
             from megatron.training.datasets import data_samplers
+
+            original_rerun_init = initialize.initialize_rerun_state_machine
+
+            @functools.wraps(original_rerun_init)
+            def rerun_init(*args, **kwargs):
+                record("runtime.rerun_inputs", {
+                    "mode": kwargs["mode"],
+                    "error_injector": kwargs["error_injector"].state_dict(),
+                    "result_rejected_tracker_filename": kwargs["result_rejected_tracker_filename"],
+                })
+                return original_rerun_init(*args, **kwargs)
+
+            initialize.initialize_rerun_state_machine = rerun_init
+            original_should_run = RerunStateMachine.should_run_forward_backward
+
+            @functools.wraps(original_should_run)
+            def should_run(self, data_iterator):
+                output = original_should_run(self, data_iterator)
+                record("runtime.rerun_steps", {
+                    "mode": self.mode, "state": self.state,
+                    "iteration": self.current_iteration, "run": output,
+                })
+                return output
+
+            RerunStateMachine.should_run_forward_backward = should_run
+            original_next = RerunDataIterator.__next__
+
+            def digest_batch(value):
+                if isinstance(value, torch.Tensor):
+                    return {"shape": list(value.shape), "dtype": str(value.dtype),
+                            "sha256": hashlib.sha256(value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()).hexdigest()}
+                if isinstance(value, dict):
+                    return {key: digest_batch(item) for key, item in value.items()}
+                if isinstance(value, (list, tuple)):
+                    return [digest_batch(item) for item in value]
+                return value
+
+            @functools.wraps(original_next)
+            def next_batch(self):
+                replaying = self.replaying
+                output = original_next(self)
+                record("runtime.rerun_batches", {"replaying": replaying, "batch": digest_batch(output)})
+                return output
+
+            RerunDataIterator.__next__ = next_batch
+            observe_call(training.stimer, "configure", "runtime.straggler_inputs")
+            observe_call(training.stimer, "report", "runtime.straggler_report")
+            original_training_log = training.training_log
+            training_log_signature = inspect.signature(original_training_log)
+
+            @functools.wraps(original_training_log)
+            def training_log(*args, **kwargs):
+                bound = training_log_signature.bind(*args, **kwargs)
+                record("runtime.training_metrics", {
+                    "iteration": bound.arguments["iteration"],
+                    "loss": {name: value.item() if isinstance(value, torch.Tensor) else value
+                             for name, value in bound.arguments["loss_dict"].items()},
+                    "learning_rate": bound.arguments["learning_rate"],
+                })
+                return original_training_log(*args, **kwargs)
+
+            training.training_log = training_log
 
             def rng_snapshot():
                 def tensor_digest(state):

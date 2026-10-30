@@ -17,6 +17,7 @@ from compare_config_seams import (
     materialize_case,
     validate,
     validate_expected,
+    validate_replay,
 )
 from snapshot import (
     LEGACY_LOGGER_FIELDS,
@@ -24,6 +25,7 @@ from snapshot import (
     dist_settings,
     encode,
     logger_settings,
+    rerun_settings,
     validation_settings,
 )
 
@@ -33,6 +35,43 @@ class SnapshotTests(unittest.TestCase):
 
     def test_equal(self):
         self.assertEqual(differences(encode({"vocab": 256}), encode({"vocab": 256})), [])
+
+    def test_rerun_tracker_owner_keeps_native_none_and_future_fields(self):
+        legacy = make_dataclass("Rerun", [("rerun_mode", str)])
+        native = make_dataclass("Rerun", [("rerun_mode", str), ("result_rejected_tracker_filename", object)])
+        args = SimpleNamespace(result_rejected_tracker_filename="tracker")
+        self.assertEqual(rerun_settings(legacy("disabled"), args),
+                         rerun_settings(native("disabled", "tracker"), SimpleNamespace()))
+        self.assertIsNone(rerun_settings(native("disabled", None), args)["result_rejected_tracker_filename"])
+        with self.assertRaises(AttributeError):
+            rerun_settings(legacy("disabled"), SimpleNamespace())
+        future = make_dataclass("Rerun", [("result_rejected_tracker_filename", object), ("future", int)])
+        self.assertTrue(differences(rerun_settings(future(None, 1), args), rerun_settings(future(None, 2), args)))
+
+    def test_replay_expectations_require_actual_replayed_batch(self):
+        expected = {"runtime.rerun_batches": {"replaying": True}}
+        snapshot = {"captures": {"runtime.rerun_batches": [{"replaying": False}]}}
+        self.assertTrue(validate_expected(snapshot, expected))
+        snapshot["captures"]["runtime.rerun_batches"].append({"replaying": True})
+        self.assertFalse(validate_expected(snapshot, expected))
+
+    def test_replay_checks_original_content_even_when_revisions_agree(self):
+        original = {"replaying": False, "batch": {"tokens": {"sha256": "original"}}}
+        replay = {"replaying": True, "batch": original["batch"]}
+        snapshot = {"schema": 1, "status": "ok", "case": "replay", "rank": 0,
+                    "environment": {}, "captures": {"runtime.rerun_batches": [original, replay]}}
+        self.assertEqual(validate_replay(snapshot), [])
+        case = {"name": "replay", "tier": "runtime", "verify_replay": True}
+        run = {"exit": 0, "snapshots": [snapshot]}
+        self.assertEqual(compare_runs(case, run, run, [])['status'], 'pass')
+        replay["batch"] = {"tokens": {"sha256": "wrong"}}
+        self.assertEqual(compare_runs(case, run, run, [])['status'], 'error')
+        del replay["batch"]
+        self.assertTrue(validate_replay(snapshot))
+        snapshot["captures"]["runtime.rerun_batches"] = [replay]
+        self.assertTrue(validate_replay(snapshot))
+        snapshot["captures"]["runtime.rerun_batches"] = [original]
+        self.assertTrue(validate_replay(snapshot))
 
     def test_dataset_callback_owner_binding(self):
         for owned in (False, True):
