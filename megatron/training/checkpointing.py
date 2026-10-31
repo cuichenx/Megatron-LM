@@ -2335,6 +2335,28 @@ def _load_base_checkpoint(
     return state_dict, checkpoint_name, release, ckpt_type
 
 
+def _load_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type) -> dict | None:
+    """Read saved config metadata for both early argument restoration and model loading."""
+    if ckpt_type == CheckpointType.LOCAL:
+        return state_dict.get('run_config')
+
+    from megatron.training.utils.checkpoint_utils import (
+        get_checkpoint_run_config_filename,
+        read_run_config,
+    )
+
+    # Legacy checkpoints name the rank-local file, not the iteration directory.
+    checkpoint_dir = (
+        os.path.dirname(os.path.dirname(checkpoint_name))
+        if ckpt_type == CheckpointType.LEGACY
+        else checkpoint_name
+    )
+    config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
+    if file_exists(config_filename):
+        return read_run_config(config_filename)
+    return None
+
+
 def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None):
     """Set required arguments from the checkpoint specified in the
     arguments.
@@ -2369,6 +2391,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
 
     checkpoint_args = state_dict['args']
     checkpoint_version = state_dict.get('checkpoint_version', 0)
+    checkpoint_config = _load_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
 
     # One-off conversion for foundation models
     if hasattr(checkpoint_args, 'disable_bias_linear'):
@@ -2391,11 +2414,20 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
         if hasattr(checkpoint_args, 'num_layers'):
             setattr(checkpoint_args, 'num_layers', None)
 
-    def _set_arg(arg_name, old_arg_name=None, force=False):
+    def _set_arg(arg_name, old_arg_name=None, force=False, *, config_section=None):
         if not force and getattr(args, arg_name, None) is not None:
             return
 
-        if old_arg_name is not None:
+        saved_config = (
+            checkpoint_config.get(config_section, {})
+            if checkpoint_config is not None and config_section is not None
+            else {}
+        )
+        # Migrated fields can be stale or absent in saved args. An explicit null
+        # in the saved config is authoritative too; fall back only for missing fields.
+        if arg_name in saved_config:
+            checkpoint_value = saved_config[arg_name]
+        elif old_arg_name is not None:
             checkpoint_value = getattr(checkpoint_args, old_arg_name, None)
         else:
             checkpoint_value = getattr(checkpoint_args, arg_name, None)
@@ -2501,10 +2533,10 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     # Tokenizer args.
     if args.use_tokenizer_model_from_checkpoint_args:
         # Using checkpoint version might not always be safe (e.g., if running on different cluster).
-        _set_arg('tokenizer_model', force=True)
-        _set_arg('tokenizer_type', force=True)
-    _set_arg('tiktoken_pattern', force=True)
-    _set_arg('padded_vocab_size')
+        _set_arg('tokenizer_model', force=True, config_section='tokenizer')
+        _set_arg('tokenizer_type', force=True, config_section='tokenizer')
+    _set_arg('tiktoken_pattern', force=True, config_section='tokenizer')
+    _set_arg('padded_vocab_size', config_section='tokenizer')
 
     # Checkpoint args.
     _set_arg('ckpt_format')
@@ -3121,7 +3153,7 @@ def load_checkpoint(
         state_dict['model'] = dtensor_state_dict
 
     ckpt_train_state = None
-    checkpoint_config = None
+    checkpoint_config = _load_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
     if ckpt_type == CheckpointType.LOCAL:
         from megatron.training.state import TrainState
 
@@ -3130,24 +3162,13 @@ def load_checkpoint(
         if 'train_state_metadata' in state_dict:
             ckpt_train_state = TrainState()
             ckpt_train_state.load_state_dict(state_dict['train_state_metadata'])
-
-        checkpoint_config = state_dict.get('run_config')
     else:
-        from megatron.training.utils.checkpoint_utils import (
-            get_checkpoint_run_config_filename,
-            read_run_config,
-        )
-
         # Legacy checkpoint_name points to an mp_rank_*/model_optim_rng.pt file.
         checkpoint_dir = (
             os.path.dirname(os.path.dirname(checkpoint_name))
             if ckpt_type == CheckpointType.LEGACY
             else checkpoint_name
         )
-        config_filename = get_checkpoint_run_config_filename(checkpoint_dir)
-        if maybe_msc.os.path.exists(config_filename):
-            checkpoint_config = read_run_config(config_filename)
-
         train_state_filename = get_checkpoint_train_state_filename(checkpoint_dir)
         if file_exists(train_state_filename):
             ckpt_train_state = read_train_state(train_state_filename)

@@ -501,6 +501,91 @@ def test_load_args_restores_activation_func_tanh_clamp_scale_from_checkpoint(
     assert restored_args.activation_func_tanh_clamp_scale == expected_scale
 
 
+@pytest.mark.parametrize(
+    "ckpt_type", [CheckpointType.LEGACY, CheckpointType.TORCH_DCP, CheckpointType.LOCAL]
+)
+@pytest.mark.parametrize(
+    "saved_config,cli_vocab,expected_vocab",
+    [
+        ({"tokenizer": {"padded_vocab_size": 32768}}, None, 32768),
+        ({"tokenizer": {"padded_vocab_size": 32768}}, 33024, 33024),
+        ({"tokenizer": {"padded_vocab_size": None}}, None, None),
+        ({"tokenizer": {}}, None, 32000),
+        ({}, None, 32000),
+        (None, None, 32000),
+    ],
+    ids=[
+        "config-owner",
+        "cli-override",
+        "explicit-null",
+        "missing-field",
+        "missing-section",
+        "legacy",
+    ],
+)
+def test_load_args_restores_tokenizer_config(
+    tmp_path, ckpt_type, saved_config, cli_vocab, expected_vocab
+):
+    """Early restoration uses config metadata without changing legacy override policy."""
+    checkpoint_args = SimpleNamespace(padded_vocab_size=32000)
+    state = {"args": checkpoint_args, "iteration": 12}
+    if ckpt_type == CheckpointType.LOCAL:
+        if saved_config is not None:
+            state["run_config"] = saved_config
+    elif saved_config is not None:
+        (tmp_path / "run_config.yaml").write_text(yaml.safe_dump(saved_config))
+    checkpoint_name = (
+        tmp_path / "mp_rank_00" / "model_optim_rng.pt"
+        if ckpt_type == CheckpointType.LEGACY
+        else tmp_path
+    )
+    args = SimpleNamespace(
+        load=str(tmp_path),
+        padded_vocab_size=cli_vocab,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state, str(checkpoint_name), False, ckpt_type),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.padded_vocab_size == expected_vocab
+    assert checkpoint_args.padded_vocab_size == 32000
+
+
+@pytest.mark.parametrize("restore_tokenizer", [False, True])
+def test_load_args_tokenizer_config_preserves_opt_in(tmp_path, restore_tokenizer):
+    """Tokenizer model/type remain opt-in; the existing pattern restore remains forced."""
+    saved_tokenizer = {
+        "tokenizer_model": "saved.model",
+        "tokenizer_type": "SentencePieceTokenizer",
+        "tiktoken_pattern": "v2",
+    }
+    (tmp_path / "run_config.yaml").write_text(yaml.safe_dump({"tokenizer": saved_tokenizer}))
+    args = SimpleNamespace(
+        load=str(tmp_path),
+        tokenizer_model="cli.model",
+        tokenizer_type="GPT2BPETokenizer",
+        tiktoken_pattern="v1",
+        use_tokenizer_model_from_checkpoint_args=restore_tokenizer,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state = {"args": SimpleNamespace(tokenizer_model="stale.model"), "iteration": 12}
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state, str(tmp_path), False, CheckpointType.TORCH_DCP),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.tokenizer_model == ("saved.model" if restore_tokenizer else "cli.model")
+    assert restored_args.tokenizer_type == (
+        "SentencePieceTokenizer" if restore_tokenizer else "GPT2BPETokenizer"
+    )
+    assert restored_args.tiktoken_pattern == "v2"
+
+
 def test_load_args_restores_wide_residual_config_from_checkpoint():
     """Checkpoint arguments should reconstruct the flat wide-residual CLI settings."""
     checkpoint_args = SimpleNamespace(
@@ -770,6 +855,9 @@ def test_save_checkpoint(
     args.profile = False
     args.profile_ranks = [99]
     args.memory_snapshot_path = "stale.pickle"
+    # Tokenizer construction now resolves padding in config, not in legacy args.
+    args.padded_vocab_size = None
+    run_config.tokenizer.padded_vocab_size = 32768
 
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
         pytest.skip("torch_dcp requires torch >= 2.4.0")
@@ -835,6 +923,18 @@ def test_save_checkpoint(
             assert saved_config["profiling"][field.name] == getattr(profiling, field.name)
         assert args.profile is False and args.profile_ranks == [99]
         assert args.memory_snapshot_path == "stale.pickle"
+
+        # Exercise a newly saved checkpoint, not a frozen pre-migration fixture.
+        inference_args = SimpleNamespace(
+            **vars(args),
+            load=args.save,
+            use_tokenizer_model_from_checkpoint_args=False,
+            use_mp_args_from_checkpoint_args=False,
+        )
+        restored_args, _ = load_args_from_checkpoint(inference_args)
+        assert restored_args.padded_vocab_size == 32768
+        assert state["args"].padded_vocab_size is None
+        assert args.padded_vocab_size is None
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
