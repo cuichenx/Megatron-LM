@@ -270,7 +270,7 @@ def test_distributed_training_services_require_explicit_opt_in(
     monkeypatch, run_config, native_model, decoder_overlap
 ):
     from megatron.core.transformer import TransformerConfig
-    from megatron.training.models import GPTModelConfig
+    from megatron.training.models import GPTModelConfig, LLaVAModelConfig
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
@@ -290,8 +290,9 @@ def test_distributed_training_services_require_explicit_opt_in(
     run_config.train.micro_batch_size = 3
     run_config.checkpoint.async_save = True
     run_config.checkpoint.use_persistent_ckpt_worker = True
+    model_config_cls = LLaVAModelConfig if decoder_overlap else GPTModelConfig
     if native_model:
-        run_config.model = GPTModelConfig(
+        run_config.model = model_config_cls(
             transformer=TransformerConfig(
                 num_layers=4, hidden_size=128, num_attention_heads=8, tp_comm_overlap=True
             ),
@@ -301,7 +302,8 @@ def test_distributed_training_services_require_explicit_opt_in(
     else:
         from megatron.training.argument_utils import model_config_from_args
 
-        run_config.model = model_config_from_args(args)
+        run_config.model = model_config_from_args(args, model_config_cls=model_config_cls)
+    del args.decoder_tp_comm_overlap
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "setup_logging", Mock())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
