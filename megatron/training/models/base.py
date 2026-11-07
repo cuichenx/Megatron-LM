@@ -2,8 +2,10 @@
 
 import abc
 import importlib
+import inspect
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -11,6 +13,8 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
+from megatron.training.models.distillation import validate_distillation_student
+from megatron.training.models.transforms import ModelTransformConfig
 
 
 @runtime_checkable
@@ -63,6 +67,9 @@ class ModelConfig:
     restore_modelopt_state: bool = False
     """Restore ModelOpt quantization/sparsity state."""
 
+    transformations: ModelTransformConfig | None = None
+    """Declarative ModelOpt layer-spec and hook setup used by GPT/Hybrid builders."""
+
     extra_checkpoint_metadata: dict[str, Any] | None = None
     """Store for additional model-related metadata to save in the checkpoint. This 
     may be useful when extending Megatron-Core models, e.g. converting to/from HuggingFace.
@@ -78,6 +85,17 @@ class ModelConfig:
     """List of functions that are executed after model initialization is complete.
     Should take the model as the only argument and return a new model as the only return value.
     """
+
+    def validate(self) -> None:
+        """Validate transformations before allocating models or loading checkpoints."""
+        if self.transformations is not None:
+            self.transformations.validate()
+            transformer_impl = getattr(self.transformer, "transformer_impl", None)
+            if transformer_impl == "inference_optimized":
+                raise ValueError(
+                    "ModelOpt transformations require the ModelOpt layer spec and cannot be "
+                    "combined with transformer_impl='inference_optimized'."
+                )
 
     def get_builder_cls(self) -> type:
         """Get the appropriate builder type for this config.
@@ -112,7 +130,8 @@ class ModelConfig:
         """Deserialize config from dictionary.
 
         Uses _target_ to determine the correct class to instantiate.
-        The builder is restored from the required _builder_ entry.
+        The serialized _builder_ value is accepted for compatibility but ignored. The
+        class selected by _target_ determines the builder through its ClassVar.
 
         Args:
             data: Dictionary with _target_ and config fields
@@ -154,10 +173,7 @@ class ModelConfig:
                 return type(value)(_from_value(item) for item in value)
             return value
 
-        result = _from_dict(data)
-        result.builder = data["_builder_"]
-
-        return result
+        return _from_dict(data)
 
 
 ModelT = TypeVar("ModelT", bound=MegatronModule)
@@ -187,6 +203,24 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
 
     def __init__(self, model_config: ModelConfig):
         self._model_config = model_config
+
+    def pre_wrap_hook(self, checkpoint=None, distillation=None) -> Callable:
+        """Resolve declarative setup for each build, without mutating runtime hook lists.
+
+        ``checkpoint`` and ``distillation`` are the run container's settings, if any.
+        """
+        config = self._model_config
+        if config.transformations is not None or distillation is not None:
+            from megatron.post_training.model_hooks import modelopt_pre_wrap_hook
+
+            # Also covers callers that build without a run container.
+            config.validate()
+            if distillation is not None:
+                distillation.validate()
+                validate_distillation_student(distillation, config)
+
+            return modelopt_pre_wrap_hook(config, checkpoint, distillation)
+        return compose_hooks(config.pre_wrap_hooks)
 
     @abc.abstractmethod
     def build_model(
@@ -223,6 +257,9 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
+        device: Any | None = None,
+        checkpoint: Any | None = None,
+        distillation: Any | None = None,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
 
@@ -239,6 +276,9 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
             use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
                 controls whether to compute and supply a shard-aligned param layout to DDP.
+            device: Explicit model placement requested by the run configuration.
+            checkpoint: Run-owned checkpoint configuration available to pre-wrap hooks.
+            distillation: Run-owned distillation configuration available to pre-wrap hooks.
 
         Returns:
             List of model stages. If the model does not support virtual pipeline parallelism,
