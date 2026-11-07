@@ -186,8 +186,11 @@ def _layout(**overrides):
         cuda_graph_impl="none",
     )
     layout.update(overrides)
+    layout["variable_seq_lengths"] = layout["sequence_packing_scheduler"] is not None
     transformer = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=8)
     for name, value in layout.items():
+        if not hasattr(transformer, name):
+            raise ValueError(f"TransformerConfig has no field {name}")
         setattr(transformer, name, value)
     return GPTModelConfig(transformer=transformer, seq_length=4096, vocab_size=2048)
 
@@ -838,7 +841,9 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
     monkeypatch.setattr(
         training,
         "get_run_config",
-        lambda: SimpleNamespace(model=None, data=DataConfig(), train=train),
+        lambda: SimpleNamespace(
+            model=SimpleNamespace(transformer=args), data=DataConfig(), train=train
+        ),
     )
     training.dummy_train_step(None)
     kw = calls.pop()
@@ -974,8 +979,9 @@ def test_varlen_datasets_and_the_packing_scheduler(container_factory):
         cfg.validate()
     cfg.model = _layout()
     cfg.validate()
-    cfg.model = None  # no model section: the model-dependent rules do not apply
-    cfg.validate()
+    cfg.model = None
+    with pytest.raises(ValueError, match="Training requires a model config"):
+        cfg.validate()
 
 
 def test_sample_length_is_a_multiple_of_twice_the_cp_size(container_factory):
@@ -1043,15 +1049,14 @@ def test_the_loop_reads_the_data_length_from_the_section(container_factory, monk
     monkeypatch.setattr(
         global_vars, "init_num_microbatches_calculator", lambda **kw: calls.append(kw)
     )
-    monkeypatch.setattr(global_vars, "get_batch_parallel_size", lambda ns: 1)
     for name in (
         "_set_tensorboard_writer",
         "_set_one_logger",
-        "_set_adlr_autoresume",
         "_set_timers",
         "_set_energy_monitor",
     ):
         monkeypatch.setattr(global_vars, name, lambda ns: None)
+    monkeypatch.setattr(global_vars, "_set_adlr_autoresume", lambda: None)
     monkeypatch.setattr(global_vars, "_set_train_state", lambda: None)
     global_vars.initialize_training_runtime_services(args)
     assert calls.pop()["seq_length"] == 16

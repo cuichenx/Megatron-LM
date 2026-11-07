@@ -49,6 +49,7 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.config import PretrainConfigContainer
+from megatron.training.config.compat import data_sequence_length
 from megatron.training.global_vars import (
     get_run_config,
     get_train_state,
@@ -250,7 +251,7 @@ def initialize_megatron(
             sequence_length = (
                 args.decoder_seq_length
                 if isinstance(cfg.model, LLaVAModelConfig)
-                else args.seq_length
+                else data_sequence_length(cfg, args)
             )
             _initialize_tp_communicators(
                 transformer_config,

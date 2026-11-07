@@ -650,10 +650,13 @@ class TestModelOptMtpSpec:
 
 class TestTeacherCheckpointConfig:
     @pytest.fixture(autouse=True)
-    def _teacher_checkpoint_exists(self, monkeypatch):
+    def _teacher_checkpoint_exists(self, monkeypatch, run_config):
         from megatron.post_training import checkpointing
 
         monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: True)
+        run_config.checkpoint.ckpt_step = 23
+        run_config.checkpoint.non_persistent_ckpt_type = "global"
+        run_config.checkpoint.non_persistent_global_ckpt_dir = "/student/non-persistent"
 
     def test_missing_teacher_checkpoint_raises(self, monkeypatch):
         from megatron.post_training import checkpointing
@@ -681,12 +684,16 @@ class TestTeacherCheckpointConfig:
 
         def load(models, optimizer, scheduler, **kwargs):
             assert models == [teacher]
-            assert args.export_kd_teacher_load == "/configured"
-            assert args.ckpt_format == "torch_dist"
-            assert args.finetune is True
-            assert args.ckpt_step is None
-            assert args.pretrained_checkpoint is None
-            assert args.non_persistent_ckpt_type is None
+            assert kwargs["load_dir"] == "/configured"
+            assert kwargs["ckpt_format"] == "torch_dist"
+            assert kwargs["finetune"] is True
+            assert kwargs["checkpoint"].ckpt_step is None
+            assert kwargs["checkpoint"].non_persistent_ckpt_type is None
+            assert kwargs["checkpoint"].non_persistent_global_ckpt_dir is None
+            assert args.export_kd_teacher_load == "/stale"
+            assert args.ckpt_format == "torch"
+            assert args.finetune is False
+            assert args.ckpt_step == 5
             if fail:
                 raise RuntimeError("load failed")
 
@@ -724,7 +731,7 @@ class TestTeacherCheckpointConfig:
         observed = []
 
         def load(*_args, **_kwargs):
-            observed.append(args.ckpt_format)
+            observed.append(_kwargs["ckpt_format"])
 
         with (
             patch.object(checkpointing, "get_args", return_value=args),
@@ -753,7 +760,7 @@ class TestTeacherCheckpointConfig:
             )
         assert not hasattr(args, "export_kd_teacher_load")
 
-    def test_modelopt_state_uses_explicit_path_and_format(self):
+    def test_modelopt_state_uses_explicit_path_and_format(self, run_config):
         from megatron.post_training import checkpointing
 
         args = Namespace(load="/student", ckpt_format="torch_dist")
@@ -764,7 +771,11 @@ class TestTeacherCheckpointConfig:
             ) as load,
         ):
             checkpointing.load_modelopt_state(Mock(), "/explicit", ckpt_format="torch")
-        load.assert_called_once_with("/explicit", args, rank0=False)
+        load.assert_called_once()
+        assert load.call_args.args == ("/explicit", args)
+        assert load.call_args.kwargs["rank0"] is False
+        assert load.call_args.kwargs["checkpoint"].ckpt_format == "torch"
+        assert run_config.checkpoint.ckpt_format == "torch_dist"
 
 
 class TestConfigurationDrivenKDLoss:

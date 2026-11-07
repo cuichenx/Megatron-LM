@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
-from pathlib import Path
 from dataclasses import replace
+from pathlib import Path
 from typing import Optional
 
 import modelopt
@@ -31,7 +31,6 @@ from megatron.training.config import CheckpointConfig
 from megatron.training.global_vars import get_run_config
 from megatron.training.models.distillation import DistillationConfig
 from megatron.training.utils import print_rank_0
-
 
 
 def has_modelopt_state(checkpoint_path: str, *, checkpoint: CheckpointConfig) -> bool:
@@ -123,7 +122,9 @@ def load_modelopt_state(
         # Non-sharded
         print_rank_0(f"Loading ModelOpt state from base checkpoint ({load_dir})")
         try:
-            state_dict, _, _, _ = _load_base_checkpoint(load_dir, get_args(), rank0=False, checkpoint=checkpoint)
+            state_dict, _, _, _ = _load_base_checkpoint(
+                load_dir, get_args(), rank0=False, checkpoint=checkpoint
+            )
         except Exception:
             print_rank_0("Failed to load base checkpoint via megatron _load_base_checkpoint!")
             return
@@ -169,8 +170,6 @@ def load_kd_teacher_checkpoint(
             f"No teacher checkpoint found at {distillation.teacher_load} (expected "
             f"{get_checkpoint_tracker_filename(distillation.teacher_load)})."
         )
-    args = get_args()
-
     teacher = unwrap_model(model[0]).teacher_model
     print_rank_0(f"Loading teacher as {type(teacher).__name__} from {distillation.teacher_load} ...")
     # The teacher is loaded weights-only (finetune-style) from its own directory and, when given,
@@ -179,8 +178,18 @@ def load_kd_teacher_checkpoint(
         [teacher],
         None,
         None,
-        load_dir=args.export_kd_teacher_load,
+        load_dir=distillation.teacher_load,
         finetune=True,
-        ckpt_format=distillation.teacher_ckpt_format or None,
+        checkpoint=replace(
+            student_checkpoint or get_run_config().checkpoint,
+            ckpt_step=None,
+            non_persistent_ckpt_type=None,
+            non_persistent_global_ckpt_dir=None,
+            pretrained_checkpoint=None,
+            override_ckpt_iteration=None,
+        ),
+        ckpt_format=distillation.teacher_ckpt_format or (
+            student_checkpoint.ckpt_format if student_checkpoint is not None else None
+        ),
     )
     print_rank_0("... teacher loaded successfully.")

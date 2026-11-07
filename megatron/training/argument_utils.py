@@ -615,6 +615,7 @@ def gpt_config_from_args(
     config: TransformerConfig | None = None,
     *,
     vocab_size_from_tokenizer: bool = True,
+    model_config_cls: type[GPTModelConfig] = GPTModelConfig,
 ) -> Any:
     """Create a GPTModelConfig from the `args` Namespace.
 
@@ -668,7 +669,7 @@ def gpt_config_from_args(
         kwargs["vocab_size"] = None if vocab_size_from_tokenizer and args.pad_vocab_size else args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return GPTModelConfig(**kwargs)
+    return model_config_cls(**kwargs)
 
 
 def _hybrid_inference_stack_spec(spec: list[str], wide_residual: bool) -> ModuleSpec | None:
@@ -703,6 +704,7 @@ def hybrid_config_from_args(
     config: TransformerConfig | None = None,
     *,
     vocab_size_from_tokenizer: bool = True,
+    model_config_cls: type[HybridModelConfig] = HybridModelConfig,
 ) -> Any:
     """Create a HybridModelConfig from the `args` Namespace.
 
@@ -765,7 +767,7 @@ def hybrid_config_from_args(
         kwargs["vocab_size"] = None if vocab_size_from_tokenizer and args.pad_vocab_size else args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return HybridModelConfig(**kwargs)
+    return model_config_cls(**kwargs)
 
 
 def tokenizer_config_from_args(args: Namespace) -> TokenizerConfig:

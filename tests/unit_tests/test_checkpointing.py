@@ -1899,8 +1899,10 @@ def test_the_load_directory_is_the_sections_unless_passed(
     run_config.checkpoint.load = "/run"
     run_config.checkpoint.pretrained_checkpoint = "/pretrained"
     loads = []
+    policies = []
 
     def base_load(load_dir, run_args, *a, finetune, **k):
+        policies.append(k["checkpoint"])
         if not k.get("rank0"):  # The final read; the rank-0 metadata read carries the same policy.
             loads.append((load_dir, finetune))
         return None, "", False, None  # Nothing to load: the call ends after resolving the policy.
@@ -1920,6 +1922,15 @@ def test_the_load_directory_is_the_sections_unless_passed(
     load_checkpoint([object()], None, None, load_dir="/teacher", finetune=True)
     assert loads == [("/run", False), ("/pretrained", True), ("/teacher", True)]
     assert run_config.checkpoint.load == "/run" and run_config.checkpoint.finetune is False
+    assert all(policy is run_config.checkpoint for policy in policies)
+    run_config.checkpoint.ckpt_step = 23
+    teacher_policy = replace(run_config.checkpoint, ckpt_step=None)
+    policies.clear()
+    load_checkpoint(
+        [object()], None, None, load_dir="/teacher", finetune=True, checkpoint=teacher_policy
+    )
+    assert policies and all(policy is teacher_policy for policy in policies)
+    assert run_config.checkpoint.ckpt_step == 23
 
 
 @pytest.mark.parametrize("cleared", [True, False])

@@ -2837,6 +2837,7 @@ def load_checkpoint(
     load_optim: Optional[bool] = None,
     load_rng: Optional[bool] = None,
     ckpt_format: Optional[str] = None,
+    checkpoint: Optional[CheckpointConfig] = None,
 ):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
@@ -2867,10 +2868,12 @@ def load_checkpoint(
         the run's checkpoint section (a weights-only load of the teacher or of RL's reference
         weights; the pretrained load of the finetune tasks without its RNG state). Everything
         else follows the section, which is not written.
+    checkpoint: Optional operation-specific policy, for example a teacher load that must not
+        inherit the student's checkpoint step or non-persistent resume directory.
     """
     cfg = get_run_config()
     args = get_args()
-    checkpoint = cfg.checkpoint
+    checkpoint = cfg.checkpoint if checkpoint is None else checkpoint
     # The policy of this load: the keyword arguments where given, the run's section otherwise.
     # Two derivations below may turn the load into a weights-only one; they stay local to this
     # call, and the primary load records the outcome on the train state (``record_finetune``).
@@ -2951,6 +2954,7 @@ def load_checkpoint(
                 rank0=True,
                 checkpointing_context=checkpointing_context,
                 finetune=finetune,
+                checkpoint=checkpoint,
                 use_megatron_fsdp=use_megatron_fsdp,
             )
 
@@ -3398,6 +3402,7 @@ def load_checkpoint(
         gpt_compat_layer_maps=gpt_compat_layer_maps,
         gtp_pad_for_alignment=gtp_pad_for_alignment,
         finetune=finetune,
+        checkpoint=checkpoint,
         use_megatron_fsdp=use_megatron_fsdp,
         **load_kwargs,
     )

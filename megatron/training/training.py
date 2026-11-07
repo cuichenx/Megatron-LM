@@ -1898,7 +1898,7 @@ def pretrain(
 
     set_jit_fusion_options(
         cfg_container.model.transformer,
-        sequence_length=args.seq_length,
+        sequence_length=data_sequence_length(cfg_container, args),
         micro_batch_size=cfg_container.train.micro_batch_size,
         tp_size=cfg_container.model.transformer.tensor_model_parallel_size,
     )
@@ -4177,7 +4177,7 @@ def training_log(
         throughput = num_floating_point_operations(
             cfg.model,
             batch_size,
-            sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
+            sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else data_sequence_length(cfg, args),
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
@@ -4329,7 +4329,7 @@ def training_log(
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(
-                    cfg, sequence_length=args.seq_length, micro_batch_size=cfg.train.micro_batch_size,
+                    cfg, sequence_length=data_sequence_length(cfg, args), micro_batch_size=cfg.train.micro_batch_size,
                     data_parallel_size=cfg.get_data_parallel_size(), world_size=safe_get_world_size(),
                     num_microbatches=num_microbatches, verbose=True,
                 )
@@ -5570,7 +5570,7 @@ def train(
         num_floating_point_operations_in_batch = num_floating_point_operations(
             cfg.model,
             batch_size,
-            sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
+            sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else data_sequence_length(cfg, args),
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         )

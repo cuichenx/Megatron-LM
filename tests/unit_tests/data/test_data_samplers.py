@@ -130,6 +130,7 @@ class TestDataLoaderResume:
         else:
             assert batch.shape == (1, 1)
 
+
 BOOLS = dict(reset_position_ids=False, reset_attention_mask=False, eod_mask_loss=False)
 BLEND = (["prefix-a"], None)
 
@@ -233,12 +234,15 @@ class TestLoaderSettingsFromTheDataSection:
         monkeypatch.setattr(
             data_samplers, "get_args", lambda: _legacy_args(dynamic_context_parallel=True)
         )
+        run_config.model.transformer.dynamic_context_parallel = True
         assert isinstance(_batch(_DictDataset()), list)
         monkeypatch.setattr(
             data_samplers,
             "get_args",
             lambda: _legacy_args(sequence_packing_scheduler="dp_balanced"),
         )
+        run_config.model.transformer.dynamic_context_parallel = False
+        run_config.model.transformer.sequence_packing_scheduler = "dp_balanced"
         assert isinstance(_batch(_DictDataset()), list)
 
     def test_sft_batches_keep_the_default_collate(self, monkeypatch, run_config):

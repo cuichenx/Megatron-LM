@@ -160,6 +160,7 @@ def test_optimizer_recipe_warning_only_for_conflicts(run_config, caplog, old_rec
 def test_optimizer_validation_uses_model_precision(run_config, model_recipe, optimizer_recipe):
     run_config.train.micro_batch_size = 1
     run_config.model.transformer.fp8_recipe = model_recipe
+    run_config.model.transformer.fp8 = "hybrid"
     run_config.optimizer.fp8_recipe = optimizer_recipe
     run_config.optimizer.optimizer_cpu_offload = True
     run_config.optimizer.use_precision_aware_optimizer = True
@@ -187,7 +188,9 @@ def test_optimizer_validation_uses_model_precision(run_config, model_recipe, opt
 @pytest.mark.parametrize("invalid_policy", ["ddp_offload", "model_pipeline"])
 def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_config, invalid_policy):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
-    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4, fp8="hybrid")
+    transformer = TransformerConfig(
+        num_layers=2, hidden_size=32, num_attention_heads=4, fp8="hybrid"
+    )
     transformer.cuda_graph_impl = "transformer_engine"
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     run_config.train.micro_batch_size = 1
@@ -354,9 +357,6 @@ def test_serialization_starts_a_new_lifecycle(
     run_config.model = model_cls(
         transformer=run_config.model.transformer, seq_length=16, vocab_size=128, **kwargs
     )
-    if isinstance(run_config.model, ModelConfig):
-        # Preserve builder metadata without treating it as a constructor keyword.
-        run_config.model.builder = "megatron.training.models.gpt.GPTModelBuilder"
     run_config.train.micro_batch_size = 1
     run_config.finalize()
     # Training attaches live objects to the transformer; checkpoint metadata must omit them.

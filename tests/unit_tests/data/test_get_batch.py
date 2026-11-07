@@ -1086,6 +1086,7 @@ def create_pretrain_data_iterator(
 
 def test_intermediate_pipeline_batch_uses_config_layout(monkeypatch):
     args = SimpleNamespace(
+        seq_length=32,
         sft=False,
         dataloader_inter_document_masking=False,
         create_attention_mask_in_dataloader=False,
@@ -1103,7 +1104,7 @@ def test_intermediate_pipeline_batch_uses_config_layout(monkeypatch):
     monkeypatch.setattr(
         pretrain_hybrid,
         "get_run_config",
-        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
+        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config), data=DataConfig()),
     )
     monkeypatch.setattr(pretrain_hybrid.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(pretrain_hybrid, "is_first_or_last_pipeline_stage", lambda stage: False)
@@ -1144,8 +1145,6 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
         linear_cp_layout="zigzag",
-        sequence_packing_scheduler="dp_balanced",
-        dynamic_context_parallel=False,
     )
     run_config = SimpleNamespace(
         model=SimpleNamespace(transformer=config),

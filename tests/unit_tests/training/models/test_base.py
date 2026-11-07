@@ -264,11 +264,10 @@ class TestModelConfigFromDict:
         with pytest.raises(ValueError):
             ModelConfig.from_dict(d)
 
-    def test_raises_if_builder_missing(self):
+    def test_builder_comes_from_target_class(self):
         d = self._dummy_dict()
         del d["_builder_"]
-        with pytest.raises(KeyError, match="_builder_"):
-            ModelConfig.from_dict(d)
+        assert ModelConfig.from_dict(d).get_builder_cls() is DummyModelConfig().get_builder_cls()
 
     def test_round_trip_flat(self):
         original = DummyModelConfig(value=21, name="round_trip")

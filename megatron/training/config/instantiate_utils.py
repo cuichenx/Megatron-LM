@@ -368,8 +368,6 @@ def instantiate_node(
             # Drop unexpected kwargs in lenient mode or raise in strict mode
             kwargs = _filter_kwargs_for_target(_target_, kwargs, full_key, mode)
             result = _call_target(_target_, partial, args, kwargs, full_key)
-            if model_config_target and not partial and "_builder_" in node:
-                result.builder = node["_builder_"]
             return result
         else:
             dict_items = {}
