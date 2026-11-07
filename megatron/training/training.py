@@ -159,6 +159,7 @@ from megatron.training.checkpointing import (
     save_grads,
 )
 from megatron.training.config import TrainingConfig, ValidationConfig
+from megatron.training.config.compat import data_sequence_length
 from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
@@ -1920,7 +1921,7 @@ def pretrain(
     warmup_training_kernels(
         cfg_container.model,
         warmup_tp_group,
-        seq_length=args.seq_length,
+        seq_length=data_sequence_length(cfg_container, args),
         micro_batch_size=cfg_container.train.micro_batch_size,
     )
     print_rank_0("Finished training-kernel warmup.")
@@ -2251,7 +2252,7 @@ def pretrain(
         train_state.do_train,
         train_state.do_valid,
         train_state.do_test,
-        args.dataloader_type,
+        cfg_container.data.dataloader.dataloader_type or 'single',
     )
 
     # Print setup timing.
@@ -3302,8 +3303,12 @@ def dummy_train_step(data_iterator):
     cfg = get_run_config()
     args = get_args()
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
+    # The data section's batch flags and length, and the model-parallel values (the model
+    # section's, or the arguments' for a container built without one).
+    flags = cfg.data.batch_flags()
+    has_cu_seqlens = flags.has_cu_seqlens
     dynamic_cp = cfg.model.transformer.dynamic_context_parallel
+    seq_length = data_sequence_length(cfg, args)
 
     BATCH_KEYS = [
         "tokens", "labels", "loss_mask", "position_ids", "attention_mask",
@@ -3327,11 +3332,11 @@ def dummy_train_step(data_iterator):
                 broadcast_group=mpu.get_tensor_model_parallel_group(),
                 has_cu_seqlens=has_cu_seqlens,
                 dynamic_cp=dynamic_cp,
-                create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
+                create_attention_mask_in_dataloader=flags.create_attention_mask,
                 cp_size=cfg.model.transformer.context_parallel_size,
                 tp_rank=tp_rank,
                 micro_batch_size=cfg.train.micro_batch_size,
-                seq_length=args.seq_length,
+                seq_length=seq_length,
                 mtp_on_this_rank=False,
                 pipeline_model_parallel_size=cfg.model.transformer.pipeline_model_parallel_size,
                 is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
@@ -3433,6 +3438,66 @@ def _get_model_pg_collection(
     return pg_collection
 
 
+def _reduce_microbatch_losses(losses_reduced, *, is_sft, sft_loss_log_mode, group):
+    """Average the per-microbatch losses of a step for reporting.
+
+    ``is_sft`` is the data section's SFT family (``cfg.data.batch_flags().is_sft``). For the
+    two-element (numerator, token count) values: SFT runs average over the trainable tokens of
+    the global batch (or, with ``--sft-loss-log-mode microbatch``, over the valid per-microbatch
+    means), the others take the ratio of the global sums; one-element values keep the legacy
+    per-microbatch mean. Reporting only; gradient normalization is elsewhere.
+    """
+    loss_reduced = {}
+    for key in losses_reduced[0].keys():
+        val = [x[key].view(-1) for x in losses_reduced]
+        if val[0].numel() == 2:
+            if is_sft and sft_loss_log_mode == 'microbatch':
+                # Some CP shards can legitimately contain no trainable tokens.
+                # Average only the valid per-microbatch losses.
+                val = torch.vstack(val)
+                numerators = val[:, 0]
+                denominators = val[:, 1]
+                valid = denominators > 0
+                if valid.any():
+                    local_sum = (numerators[valid] / denominators[valid]).sum()
+                    local_count = torch.tensor(
+                        float(valid.sum().item()),
+                        dtype=local_sum.dtype,
+                        device=local_sum.device,
+                    )
+                else:
+                    local_sum = torch.zeros_like(numerators[0])
+                    local_count = torch.zeros_like(denominators[0])
+
+                torch.distributed.all_reduce(local_sum, group=group)
+                torch.distributed.all_reduce(local_count, group=group)
+                loss_reduced[key] = torch.where(
+                    local_count > 0,
+                    local_sum / local_count.clamp(min=1),
+                    torch.zeros_like(local_sum),
+                )
+            elif is_sft:
+                # Average over the total number of tokens across the global batch.
+                val = torch.vstack(val).sum(dim=0)
+                torch.distributed.all_reduce(val, group=group)
+                loss_reduced[key] = torch.where(
+                    val[1] > 0,
+                    val[0] / val[1].clamp(min=1),
+                    torch.zeros_like(val[0]),
+                )
+            else:
+                val = torch.vstack(val).sum(dim=0)
+                torch.distributed.all_reduce(val, group=group)
+                loss_reduced[key] = val[0] / val[1]
+        elif val[0].numel() == 1:
+            # legacy behavior, we average over the number of microbatches
+            val = torch.cat(val).mean()
+            loss_reduced[key] = val
+        else:
+            raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
+    return loss_reduced
+
+
 def train_step(
     forward_step_func,
     data_iterator,
@@ -3498,7 +3563,7 @@ def train_step(
             # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
-                seq_length=args.seq_length,
+                seq_length=data_sequence_length(cfg, args),
                 micro_batch_size=cfg.train.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
             )
@@ -3593,7 +3658,7 @@ def train_step(
                 data_iterator=forward_backward_data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
-                seq_length=args.seq_length,
+                seq_length=data_sequence_length(cfg, args),
                 micro_batch_size=cfg.train.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=forward_only,
@@ -3738,54 +3803,12 @@ def train_step(
     if is_last_stage and losses_reduced:
         # Average loss across microbatches.
         # Last stage may have no loss (e.g. MIMO encoder-grid ranks).
-        loss_reduced = {}
-        for key in losses_reduced[0].keys():
-            val = [x[key].view(-1) for x in losses_reduced]
-            if val[0].numel() == 2:
-                if args.sft and args.sft_loss_log_mode == 'microbatch':
-                    # Some CP shards can legitimately contain no trainable tokens.
-                    # Average only the valid per-microbatch losses.
-                    val = torch.vstack(val)
-                    numerators = val[:, 0]
-                    denominators = val[:, 1]
-                    valid = denominators > 0
-                    if valid.any():
-                        local_sum = (numerators[valid] / denominators[valid]).sum()
-                        local_count = torch.tensor(
-                            float(valid.sum().item()),
-                            dtype=local_sum.dtype,
-                            device=local_sum.device,
-                        )
-                    else:
-                        local_sum = torch.zeros_like(numerators[0])
-                        local_count = torch.zeros_like(denominators[0])
-
-                    torch.distributed.all_reduce(local_sum, group=dp_cp_group)
-                    torch.distributed.all_reduce(local_count, group=dp_cp_group)
-                    loss_reduced[key] = torch.where(
-                        local_count > 0,
-                        local_sum / local_count.clamp(min=1),
-                        torch.zeros_like(local_sum),
-                    )
-                elif args.sft:
-                    # Average over the total number of tokens across the global batch.
-                    val = torch.vstack(val).sum(dim=0)
-                    torch.distributed.all_reduce(val, group=dp_cp_group)
-                    loss_reduced[key] = torch.where(
-                        val[1] > 0,
-                        val[0] / val[1].clamp(min=1),
-                        torch.zeros_like(val[0]),
-                    )
-                else:
-                    val = torch.vstack(val).sum(dim=0)
-                    torch.distributed.all_reduce(val, group=dp_cp_group)
-                    loss_reduced[key] = val[0] / val[1]
-            elif val[0].numel() == 1:
-                # legacy behavior, we average over the number of microbatches
-                val = torch.cat(val).mean()
-                loss_reduced[key] = val
-            else:
-                raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
+        loss_reduced = _reduce_microbatch_losses(
+            losses_reduced,
+            is_sft=cfg.data.batch_flags().is_sft,
+            sft_loss_log_mode=args.sft_loss_log_mode,
+            group=dp_cp_group,
+        )
         return (
             loss_reduced,
             skipped_iter,
@@ -3947,7 +3970,7 @@ def training_log(
     )
 
     # Track app tag & app tag ID
-    one_logger_utils.track_app_tag(batch_size, safe_get_world_size(), args.seq_length)
+    one_logger_utils.track_app_tag(batch_size, safe_get_world_size(), data_sequence_length(cfg, args))
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
     if packed_sequence_stats and wandb_writer:
@@ -4284,7 +4307,7 @@ def training_log(
             from megatron.core.telemetry.training_metrics import record_training_metrics
             _avg_loss = _otel_loss_snapshot
             _tokens_per_sec = (
-                batch_size * args.seq_length / elapsed_time_per_iteration
+                batch_size * data_sequence_length(cfg, args) / elapsed_time_per_iteration
                 if elapsed_time_per_iteration > 0 else None
             )
             _mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else None
@@ -4405,7 +4428,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
         num_floating_point_operations_so_far - start_num_floating_point_operations
     ) / (elapsed_time * 10**12 * llm_world_size)
 
-    tokens_so_far = train_state.consumed_train_samples * args.seq_length
+    tokens_so_far = train_state.consumed_train_samples * data_sequence_length(get_run_config(), args)
     saved_ckpt_prefix = 'Saving async checkpoint' if checkpoint.async_save else 'Saved checkpoint'
     append_to_progress_log(
         checkpoint.save,
@@ -4991,7 +5014,7 @@ def train(
         iteration=iteration,
         consumed_train_samples=train_state.consumed_train_samples,
         train_samples=cfg.train.train_samples,
-        seq_length=args.seq_length,
+        seq_length=data_sequence_length(cfg, args),
         train_iters=cfg.train.train_iters,
         save=cfg.checkpoint.save,
         async_save=cfg.checkpoint.async_save,
@@ -5134,7 +5157,7 @@ def train(
             'num_floating_point_operations_so_far': train_state.num_floating_point_operations_so_far,
             'consumed_train_samples': train_state.consumed_train_samples,
             'world_size': cfg.get_model_world_size(),
-            'seq_length': args.seq_length,
+            'seq_length': data_sequence_length(cfg, args),
         }
 
     # Cache into one-logger for callback.
@@ -5201,7 +5224,7 @@ def train(
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
-            seq_length=args.seq_length,
+            seq_length=data_sequence_length(cfg, args),
             micro_batch_size=cfg.train.micro_batch_size,
             optimizers=[optimizer],
         )
@@ -5879,7 +5902,7 @@ def evaluate(
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,
-            seq_length=args.seq_length,
+            seq_length=data_sequence_length(cfg, args),
             micro_batch_size=eval_micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
         )
@@ -5931,7 +5954,7 @@ def evaluate(
                     data_iterator=packed_data_iterator,
                     model=model,
                     num_microbatches=scheduled_eval_num_microbatches,
-                    seq_length=args.seq_length,
+                    seq_length=data_sequence_length(cfg, args),
                     micro_batch_size=eval_micro_batch_size,
                     decoder_seq_length=args.decoder_seq_length,
                     forward_only=True,
@@ -5992,7 +6015,7 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
+                seq_length=data_sequence_length(cfg, args),
                 micro_batch_size=eval_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
@@ -6361,7 +6384,7 @@ def build_train_valid_test_data_iterators(
     )
 
     # Build iterators.
-    dl_type = args.dataloader_type
+    dl_type = cfg.data.dataloader.dataloader_type or 'single'  # unset selects single
     assert dl_type in ['single', 'cyclic', 'external']
 
     def _get_iterator(dataloader_type, dataloader):

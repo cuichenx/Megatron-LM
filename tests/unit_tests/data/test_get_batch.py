@@ -26,9 +26,13 @@ from megatron.core.utils import (
     flatten_batch_for_packed_sequences,
     get_batch_on_this_cp_rank,
 )
-from megatron.training import global_vars
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training import arguments, global_vars
+from megatron.training.argument_utils import (
+    gpt_data_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config import DataConfig
 from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from pretrain_hybrid import get_batch
@@ -53,6 +57,7 @@ def initialize_test_environment(
     hybrid_context_parallel: bool = False,
     max_seqlen_per_cp_rank: int = 1024,
     create_attention_mask: bool = False,
+    inter_document_masking: bool = False,
 ):
     destroy_global_vars()
     destroy_num_microbatches_calculator()
@@ -69,6 +74,7 @@ def initialize_test_environment(
     args.sft = sft
     args.micro_batch_size = micro_batch_size
     args.create_attention_mask_in_dataloader = create_attention_mask
+    args.dataloader_inter_document_masking = inter_document_masking
     args.global_batch_size = global_batch_size
     args.calculate_per_token_loss = True
     args.num_layers = 4
@@ -80,7 +86,7 @@ def initialize_test_environment(
     os.environ['NCCL_NVLS_ENABLE'] = '0'  # NOTE(asolergi-nv): Without this, NCCL crashes
 
     validate_args(args)
-    cfg = pretrain_cfg_container_from_args(args)
+    cfg = pretrain_cfg_container_from_args(args, data_cfg=gpt_data_config_from_args(args))
     cfg.tokenizer = TokenizerConfig(vocab_size=1024, tokenizer_type="NullTokenizer")
     set_global_variables(args, cfg, build_tokenizer=True)
 
@@ -564,8 +570,8 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
         micro_batch_size=1,
         global_batch_size=global_batch_size,
         sft=False,
+        inter_document_masking=True,
     )
-    args.dataloader_inter_document_masking = True
 
     data_iterator = None
     if mpu.get_tensor_model_parallel_rank() == 0:
@@ -1138,15 +1144,18 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
         linear_cp_layout="zigzag",
+        sequence_packing_scheduler="dp_balanced",
+        dynamic_context_parallel=False,
+    )
+    run_config = SimpleNamespace(
+        model=SimpleNamespace(transformer=config),
+        data=DataConfig(),
+        train=SimpleNamespace(micro_batch_size=1),
     )
 
     with (
         patch.object(pretrain_hybrid, "get_args", return_value=args),
-        patch.object(
-            pretrain_hybrid,
-            "get_run_config",
-            return_value=SimpleNamespace(model=SimpleNamespace(transformer=config)),
-        ),
+        patch.object(pretrain_hybrid, "get_run_config", return_value=run_config),
         patch.object(pretrain_hybrid, "mtp_on_this_rank_func", return_value=True),
         patch.object(
             pretrain_hybrid,
@@ -1183,7 +1192,7 @@ def test_get_batch_reuses_run_config_without_rebuilding(script, monkeypatch):
         )
         for _ in range(2)
     ]
-    cfg = SimpleNamespace(model=SimpleNamespace(transformer=configs[0]))
+    cfg = SimpleNamespace(model=SimpleNamespace(transformer=configs[0]), data=DataConfig())
     result = object()
     fetch_batch = MagicMock(return_value=result)
     monkeypatch.setattr(script, "get_args", lambda: args)
@@ -1203,7 +1212,7 @@ def test_get_batch_reuses_run_config_without_rebuilding(script, monkeypatch):
     assert fetch_batch.call_args.kwargs["config"] is configs[0]
 
     # A new run supplies its own model config; no cached CLI config leaks across runs.
-    cfg = SimpleNamespace(model=SimpleNamespace(transformer=configs[1]))
+    cfg = SimpleNamespace(model=SimpleNamespace(transformer=configs[1]), data=DataConfig())
     for _ in range(2):
         assert script.get_batch(None, pg_collection=pg_collection) is result
         assert fetch_batch.call_args.kwargs["config"] is configs[1]
@@ -1640,8 +1649,8 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
         micro_batch_size=micro_batch_size,
         global_batch_size=global_batch_size,
         sft=False,
+        inter_document_masking=True,
     )
-    args.dataloader_inter_document_masking = True
 
     data_iterator = None
     if mpu.get_tensor_model_parallel_rank() == 0:
