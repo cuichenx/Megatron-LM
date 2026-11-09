@@ -273,18 +273,18 @@ def build_parser(*, include_execution: bool) -> argparse.ArgumentParser:
         epilog="""
 Examples:
   # Local CPU import
-  ./scripts/conversion/convert.sh import --executor local --device cpu \\
+  ./examples/bridge/conversion/convert.sh import --executor local --device cpu \\
       --hf-model meta-llama/Llama-3.2-1B --megatron-path /workspace/llama-megatron
 
   # Slurm distributed GPU export
-  ./scripts/conversion/convert.sh export --executor slurm --device gpu \\
+  ./examples/bridge/conversion/convert.sh export --executor slurm --device gpu \\
       --nodes 1 --gpus-per-node 8 --account ACCOUNT --partition PARTITION \\
       --container-image IMAGE --mount /workspace --env HF_TOKEN \\
       --hf-model Qwen/Qwen3-30B-A3B --megatron-path /workspace/qwen/iter_0000000 \\
       --hf-path /workspace/qwen-hf --ep 8
 
   # Local multi-GPU round-trip validation
-  ./scripts/conversion/convert.sh roundtrip --executor local --device gpu \\
+  ./examples/bridge/conversion/convert.sh roundtrip --executor local --device gpu \\
       --gpus-per-node 8 --hf-model Qwen/Qwen3-30B-A3B \\
       --ep 8
 

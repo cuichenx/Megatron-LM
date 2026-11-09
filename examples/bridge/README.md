@@ -34,15 +34,19 @@ installation and assume both packages are active.
 
 ## Offline probe
 
+Conversion entrypoints live in `examples/bridge/conversion`, with shared launcher
+helpers in `examples/bridge/common`. The reduced forward/backward probe lives in
+`examples/bridge/training`; it is not a full training entrypoint.
+
 Inside a compatible GPU development environment:
 
 ```bash
 PYTHONPATH=. uv run --no-project python -m torch.distributed.run \
-  --nproc-per-node=1 tools/bridge/smoke_super_vl.py
+  --nproc-per-node=1 examples/bridge/training/smoke_super_vl.py
 
 # Additionally build the full RADIO encoder with a tiny language model:
 PYTHONPATH=. uv run --no-project python -m torch.distributed.run \
-  --nproc-per-node=1 tools/bridge/smoke_super_vl.py --vision
+  --nproc-per-node=1 examples/bridge/training/smoke_super_vl.py --vision
 ```
 
 The probe uses random reduced language weights, checks local import provenance,
@@ -53,12 +57,12 @@ or validation of the unified `pretrain()` lifecycle.
 
 ## Conversion entrypoint
 
-Use Bridge's existing `scripts/conversion/convert.sh` and
-`scripts/conversion/run_conversion.py`, copied from
+Use Bridge's existing `examples/bridge/conversion/convert.sh` and
+`examples/bridge/conversion/run_conversion.py`, copied from
 [`08035723`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/08035723e7a86f94fc54a7f4473bd0519f2ac941/scripts/conversion).
 The launcher changes only repository-root/import paths. Its conversion workers
 are retained; this branch supplies their model/conversion dependencies inside MLM.
-The older `tools/bridge/convert_checkpoint.py` is retained only as a historical
+The older `examples/bridge/conversion/convert_checkpoint.py` is retained only as a historical
 prototype, not the entrypoint used for the comparison below.
 
 The native output stores `model`/`modelN` weights,
@@ -69,18 +73,18 @@ For an already accessible HF checkpoint, using an appropriately sized GPU job:
 
 ```bash
 PYTHONPATH=. uv run --no-project python -m torch.distributed.run \
-  --nproc-per-node=8 scripts/conversion/run_conversion.py import --device gpu \
+  --nproc-per-node=8 examples/bridge/conversion/run_conversion.py import --device gpu \
   --hf-model /models/super-vl --megatron-path /checkpoints/super-vl \
   --tp 2 --ep 8 --etp 1 --trust-remote-code
 
 # Same source, but import only its language weights:
 PYTHONPATH=. uv run --no-project python -m torch.distributed.run \
-  --nproc-per-node=8 scripts/conversion/run_conversion.py import --device gpu \
+  --nproc-per-node=8 examples/bridge/conversion/run_conversion.py import --device gpu \
   --hf-model /models/super-vl --megatron-path /checkpoints/super-text \
   --tp 2 --ep 8 --etp 1 --trust-remote-code --text-only
 
 PYTHONPATH=. uv run --no-project python -m torch.distributed.run \
-  --nproc-per-node=8 scripts/conversion/run_conversion.py export --device gpu \
+  --nproc-per-node=8 examples/bridge/conversion/run_conversion.py export --device gpu \
   --hf-model /models/super-vl --megatron-path /checkpoints/super-text \
   --hf-path /exports/super-text --tp 2 --ep 8 --etp 1 --trust-remote-code --text-only
 ```

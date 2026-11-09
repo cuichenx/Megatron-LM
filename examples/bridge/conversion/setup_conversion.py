@@ -39,7 +39,7 @@ from torchx.specs.api import AppState
 logger = logging.getLogger(__name__)
 
 CONTAINER_REPO_ROOT = Path("/opt/Megatron-LM")
-LOCAL_REPO_ROOT = Path(__file__).resolve().parents[2]
+LOCAL_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _parse_env(values: list[str]) -> list[str]:
@@ -246,7 +246,7 @@ def _build_executor(args: argparse.Namespace, env_names: list[str], mounts: list
 def _build_task(args: argparse.Namespace) -> tuple[run.Script, list[str]]:
     """Build the in-job conversion or round-trip task and its display arguments."""
     display_args = conversion_worker_args(args)
-    relative_task_path = Path("scripts/conversion/run_conversion.py")
+    relative_task_path = Path("examples/bridge/conversion/run_conversion.py")
     repo_root = LOCAL_REPO_ROOT if args.executor == "local" else CONTAINER_REPO_ROOT
     task_args = (
         display_args

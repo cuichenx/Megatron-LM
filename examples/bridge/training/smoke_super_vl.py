@@ -74,7 +74,7 @@ def main() -> None:
         help="Local trusted Super VL config/code artifacts for a reduced-language VL fixture",
     )
     options = parser.parse_args()
-    root = Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[3]
     assert Path(inspect.getfile(AutoBridge)).is_relative_to(root / "megatron/bridge")
     text = language_config()
     text.num_nextn_predict_layers = 1
