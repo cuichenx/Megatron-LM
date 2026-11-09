@@ -2,32 +2,96 @@
 
 name: Auto Swap Labels
 on:
-  pull_request_review:
-    types: [submitted]
+  pull_request_target:
+    types: [ready_for_review, synchronize]
+    branches:
+      - main
+  workflow_run:
+    workflows: ["Review Trigger"]
+    types: [completed]
 
 permissions:
-  pull-requests: write
   contents: read
+  actions: read
 
 jobs:
   check-approval:
     runs-on: ubuntu-latest
-    if: github.event.review.state == 'approved' && github.repository == 'NVIDIA/Megatron-LM'
+    if: >-
+      github.repository == 'NVIDIA/Megatron-LM' && (
+        (github.event_name == 'pull_request_target' &&
+         github.event.pull_request.base.ref == 'main' &&
+         !github.event.pull_request.draft) ||
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success')
+      )
+
     steps:
+      - name: Get PR number from workflow_run
+        id: get-pr
+        if: github.event_name == 'workflow_run'
+        continue-on-error: true
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: pr-number
+          path: pr-number
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Set PR number
+        id: pr
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ARTIFACT_OUTCOME: ${{ steps.get-pr.outcome }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            if [ "$ARTIFACT_OUTCOME" != "success" ]; then
+              echo "No approval artifact found — review was not an approval. Skipping."
+              exit 0
+            fi
+            pr_number=$(cat pr-number/number)
+          else
+            pr_number="$EVENT_PR_NUMBER"
+          fi
+
+          if [[ ! "$pr_number" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Invalid PR number"
+            exit 1
+          fi
+          printf 'number=%s\n' "$pr_number" >> "$GITHUB_OUTPUT"
+
       - name: Check out repository code
-        uses: actions/checkout@v4
+        if: steps.pr.outputs.number
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        if: steps.pr.outputs.number
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
 
       - name: Install dependencies
+        if: steps.pr.outputs.number
         run: |
           pip install --no-cache-dir PyGithub slack-sdk
 
-      - name: Run Auto Reminder Bot
-        run: |
-          export GH_TOKEN=${{ github.token }}
-          export PR_NUMBER=${{ github.event.pull_request.number }}
-          python tests/test_utils/python_scripts/swap_pr_labels.py
+      - name: Create GitHub App token
+        id: app-token
+        if: steps.pr.outputs.number
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          # The community App has organization team access; the release App does not.
+          app-id: ${{ vars.COMMUNITY_BOT_ID }}
+          private-key: ${{ secrets.COMMUNITY_BOT_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-members: read
+          permission-pull-requests: write
+
+      - name: Run Auto Swap Labels
+        if: steps.pr.outputs.number
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: python tests/test_utils/python_scripts/swap_pr_labels.py

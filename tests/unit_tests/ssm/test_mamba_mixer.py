@@ -1,12 +1,16 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
 import torch
+from einops import rearrange
 
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_mixer import MambaMixer
+from megatron.core.ssm.mamba_layer import MambaLayerSubmodules
+from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -21,7 +25,14 @@ class TestMambaMixer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def get_mixer(self, tp_size=1, cp_size=1, use_mem_eff_path=True):
+    def get_mixer(
+        self,
+        tp_size=1,
+        cp_size=1,
+        use_mem_eff_path=True,
+        batch_invariant=False,
+        params_dtype=torch.float32,
+    ):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
             pipeline_model_parallel_size=1,
@@ -35,15 +46,23 @@ class TestMambaMixer:
             num_layers=1,
             num_attention_heads=1,
             use_cpu_initialization=True,
+            use_mamba_mem_eff_path=use_mem_eff_path,
+            params_dtype=params_dtype,
         )
-        modules = mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules
+        # Only the mixer's decode caches depend on it; skip the full mode validation.
+        transformer_config.batch_invariant_mode = batch_invariant
+        assert isinstance(hybrid_stack_spec.submodules, HybridStackSubmodules)
+        assert isinstance(hybrid_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules)
+        assert isinstance(
+            hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+            MambaMixerSubmodules,
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         mixer = MambaMixer(
             transformer_config,
-            modules,
+            hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
             transformer_config.hidden_size,
             layer_number=1,
-            use_mem_eff_path=use_mem_eff_path,
             pg_collection=pg_collection,
         )
         mixer.cuda()
@@ -84,19 +103,94 @@ class TestMambaMixer:
             max_batch_size=max(micro_batch_sizes), max_sequence_length=sequence_length
         )
 
-        for micro_batch_size in micro_batch_sizes:
-            inference_context.max_seqlen = inference_context.max_sequence_length
-            inference_context.seqlen_offset = inference_context.sequence_len_offset
-            hidden_states = torch.ones(
-                (sequence_length, micro_batch_size, mixer.config.hidden_size)
+        with InferenceMode.active():
+            for micro_batch_size in micro_batch_sizes:
+                inference_context.max_seqlen = inference_context.max_sequence_length
+                inference_context.seqlen_offset = inference_context.sequence_len_offset
+                hidden_states = torch.ones(
+                    (sequence_length, micro_batch_size, mixer.config.hidden_size)
+                )
+                hidden_states = hidden_states.cuda()
+                output, bias = mixer(hidden_states, inference_context=inference_context)
+                assert mixer.config.mamba_num_heads == None
+                assert output.shape[0] == sequence_length
+                assert output.shape[1] == micro_batch_size
+                assert output.shape[2] == mixer.config.hidden_size
+                assert output.dtype == torch.float32
+
+    @pytest.mark.parametrize("refresh_on_eval", [False, True], ids=["direct", "eval"])
+    def test_refreshes_decode_cache_in_place(self, refresh_on_eval):
+        mixer = self.get_mixer()
+        cache_ptr = mixer._inference_cache.A_neg_exp.data_ptr()
+
+        with torch.no_grad():
+            mixer.A_log.add_(1.0)
+        if refresh_on_eval:
+            mixer.train()
+            mixer.eval()
+        else:
+            mixer.refresh_cache()
+
+        torch.testing.assert_close(
+            mixer._inference_cache.A_neg_exp, -torch.exp(mixer.A_log.float())
+        )
+        assert mixer._inference_cache.A_neg_exp.data_ptr() == cache_ptr
+        assert not mixer._inference_cache.stale
+
+    @pytest.mark.parametrize("batch_invariant", [False, True], ids=["default", "bi"])
+    @pytest.mark.parametrize("refresh_on_eval", [False, True], ids=["direct", "eval"])
+    def test_refreshes_fp32_param_caches_in_place(self, refresh_on_eval, batch_invariant):
+        """Inference reads FP32 conv weight/bias (and, in batch-invariant mode, A and
+        dt_bias) from caches that hold exactly the per-step values and refresh in place."""
+        mixer = self.get_mixer(batch_invariant=batch_invariant, params_dtype=torch.bfloat16)
+        caches = [mixer._inference_cache.conv_weight, mixer._inference_cache.conv_bias]
+        if batch_invariant:
+            caches += [mixer._inference_cache.A_neg_exp, mixer._inference_cache.dt_bias]
+        ptrs = [c.data_ptr() for c in caches]
+
+        with torch.no_grad():
+            for p in (mixer.A_log, mixer.dt_bias, mixer.conv1d_weight, mixer.conv1d_bias):
+                p.add_(0.5)
+        if refresh_on_eval:
+            mixer.train()
+            mixer.eval()
+        else:
+            mixer.refresh_cache()
+            mixer.eval()  # already refreshed: eval() must not need to refresh again
+
+        with torch.no_grad():
+            got = list(
+                mixer._get_conv_params(mixer.conv1d_weight, mixer.conv1d_bias, torch.float32)
             )
-            hidden_states = hidden_states.cuda()
-            output, bias = mixer(hidden_states, inference_context=inference_context)
-            assert mixer.config.mamba_num_heads == None
-            assert output.shape[0] == sequence_length
-            assert output.shape[1] == micro_batch_size
-            assert output.shape[2] == mixer.config.hidden_size
-            assert output.dtype == torch.float32
+            bi = mixer._get_batch_invariant_decode_params()
+        expected = [
+            rearrange(mixer.conv1d_weight, "d 1 w -> d w").float(),
+            mixer.conv1d_bias.float(),
+        ]
+        if batch_invariant:
+            got += [bi.A_neg_exp, bi.dt_bias]
+            expected += [-torch.exp(mixer.A_log.float()), mixer.dt_bias.float()]
+        else:
+            assert bi is None
+        for g, e in zip(got, expected):
+            assert torch.equal(g, e)
+        assert [c.data_ptr() for c in got] == ptrs
+        # Grad mode (and training) computes the values per call instead.
+        weight, _ = mixer._get_conv_params(mixer.conv1d_weight, mixer.conv1d_bias, torch.float32)
+        assert weight.data_ptr() != ptrs[0]
+        assert mixer._get_batch_invariant_decode_params() is None
+
+    def test_no_batch_invariant_caches_by_default(self):
+        mixer = self.get_mixer().eval()
+        assert mixer._inference_cache.dt_bias is None
+        with torch.no_grad():
+            assert mixer._get_batch_invariant_decode_params() is None
+            # FP32 parameters need no cast, so the conv kernels read them directly.
+            weight, bias = mixer._get_conv_params(
+                mixer.conv1d_weight, mixer.conv1d_bias, torch.float32
+            )
+        assert weight.data_ptr() == mixer.conv1d_weight.data_ptr()
+        assert bias.data_ptr() == mixer.conv1d_bias.data_ptr()
 
 
 class TestMambaMixerErrorChecks:
@@ -119,12 +213,17 @@ class TestMambaMixerErrorChecks:
             use_cpu_initialization=True,
             mamba_num_groups=ngroups,
         )
-        submodules = mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules
+        assert isinstance(hybrid_stack_spec.submodules, HybridStackSubmodules)
+        assert isinstance(hybrid_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules)
+        assert isinstance(
+            hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+            MambaMixerSubmodules,
+        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         with pytest.raises(AssertionError, match=expected_error_message):
             MambaMixer(
                 transformer_config,
-                submodules,
+                hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
                 transformer_config.hidden_size,
                 pg_collection=pg_collection,
             )

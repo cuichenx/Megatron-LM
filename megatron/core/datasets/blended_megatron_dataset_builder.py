@@ -1,5 +1,6 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import contextvars
 import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
@@ -54,10 +55,17 @@ class BlendedMegatronDatasetBuilder(object):
         self.is_built_on_rank = is_built_on_rank
         self.config = config
 
+        # The config may have been completed after construction (its tokenizer bound later):
+        # validate it before it is read.
+        self.config.validate()
+
         log_single_rank(
             logger,
             logging.INFO,
-            f"Building {cls.__name__} splits with sizes={self.sizes} and config={self.config}",
+            "Building %s splits with sizes=%s and config=%s",
+            cls.__name__,
+            self.sizes,
+            self.config,
         )
 
         if not self.config.mock:
@@ -357,8 +365,17 @@ class BlendedMegatronDatasetBuilder(object):
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 all_futures = []
                 for i in range(len(prefixes)):
+                    # Run each task inside a copy of the current contextvars so
+                    # the OTel active span (build_datasets) propagates into the
+                    # worker thread -- otherwise the trace_region spans created
+                    # deeper (build_low_level_dataset, build_document_index, ...)
+                    # orphan, since OTel context is thread-local. A fresh copy
+                    # per task avoids Context.run()'s re-entrancy error across
+                    # parallel threads. Pure stdlib -- no OTel import here.
+                    task_ctx = contextvars.copy_context()
                     all_futures.append(
                         executor.submit(
+                            task_ctx.run,
                             self._build_megatron_dataset_splits,
                             prefixes[i],
                             split,

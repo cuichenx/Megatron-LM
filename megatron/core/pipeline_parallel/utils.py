@@ -1,13 +1,133 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Callable, Optional
 
 import torch
 from torch.autograd import Variable
 
-from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    log_single_rank,
+    make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ScheduleNodeInputWrapper(torch.Tensor):
+    """Storage-free autograd leaf for a ScheduleNode input.
+
+    Construction detaches the real input from its producer graph. Unwrapping
+    then connects that detached tensor to this storage-free leaf, creating the
+    consumer-side autograd graph boundary. After unwrapping, the wrapper retains
+    only tensor metadata and the eventual input gradient.
+    """
+
+    @staticmethod
+    def __new__(cls, real_tensor):
+        assert real_tensor._base is None, "ScheduleNodeInputWrapper real tensor must be viewless"
+        wrapper = torch.Tensor._make_wrapper_subclass(
+            cls,
+            tuple(real_tensor.shape),
+            strides=tuple(real_tensor.stride()),
+            storage_offset=real_tensor.storage_offset(),
+            dtype=real_tensor.dtype,
+            layout=real_tensor.layout,
+            device=real_tensor.device,
+            requires_grad=real_tensor.requires_grad,
+        )
+        wrapper._real_tensor = real_tensor.detach().requires_grad_(real_tensor.requires_grad)
+        return wrapper
+
+    def _take_real_tensor(self):
+        """Transfer the real tensor out of this move-only wrapper."""
+        real_tensor = self._real_tensor
+        if real_tensor is None:
+            raise RuntimeError("Real tensor has already been consumed")
+        self._real_tensor = None
+        return real_tensor
+
+    def unwrap_real_tensor(self):
+        """Unwrap the detached real tensor and route its gradient to this wrapper."""
+        return _UnwrapRealTensor.apply(self)
+
+    def untyped_storage(self):
+        """The wrapper itself never owns activation storage."""
+        return torch.UntypedStorage(0, device=self.device)
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        # The wrapper is only an autograd leaf; all model operations receive the
+        # normal tensor returned by _UnwrapRealTensor.
+        if func in (torch.ops.aten.detach.default, torch.ops.aten.alias.default):
+            wrapper = args[0]
+            out = torch.Tensor._make_wrapper_subclass(
+                cls,
+                tuple(wrapper.shape),
+                strides=tuple(wrapper.stride()),
+                storage_offset=wrapper.storage_offset(),
+                dtype=wrapper.dtype,
+                layout=wrapper.layout,
+                device=wrapper.device,
+                requires_grad=(
+                    False if func == torch.ops.aten.detach.default else wrapper.requires_grad
+                ),
+            )
+            out._real_tensor = wrapper._real_tensor
+            return out
+        raise RuntimeError(f"Unsupported operation on schedule-node input wrapper: {func}")
+
+
+class _UnwrapRealTensor(torch.autograd.Function):
+    """Connect a wrapper leaf to its already-detached real tensor."""
+
+    @staticmethod
+    def forward(ctx, wrapper):
+        """Return the real tensor while connecting it to the wrapper leaf."""
+        return wrapper._take_real_tensor()
+
+    @staticmethod
+    def backward(ctx, grad):
+        """Pass the real tensor's gradient back to the wrapper leaf."""
+        return grad
+
+
+class StageDispatchBwdGrad(torch.autograd.Function):
+    """1F1B + NCCL-EP zero-copy only: redirect the dispatch-backward grad into the persistent
+    symm buffer so the one-sided ``dispatch_bwd`` can consume it.
+
+    Under the 1F1B overlap schedule the dispatch output is consumed by the next node, which
+    detaches it into a leaf; autograd therefore hands ``dispatch_bwd`` a non-symm
+    ``AccumulateGrad`` clone. Applying this identity node to the dispatch output — while it is
+    still inside the dispatch node's own graph segment — makes it the sole consumer, moving that
+    accumulation to *our* output; the backward then does a single plain->symm copy into the
+    dispatcher's ``_zc_bwd_token_buf``. That buffer is free to stage into precisely because
+    ``get_expert_zero_copy_buffers`` withholds it from the op-fuser under overlap.
+    Forward is identity (no numeric effect).
+    """
+
+    @staticmethod
+    def forward(ctx, dispatched_tokens, token_dispatcher):  # type: ignore[override]
+        """Identity forward; stashes the dispatcher so backward can reach its symm buffer."""
+        ctx.token_dispatcher = token_dispatcher
+        return dispatched_tokens
+
+    @staticmethod
+    def backward(ctx, grad):  # type: ignore[override]
+        """Stage the incoming gradient into the symm dispatch-backward buffer."""
+        buf = ctx.token_dispatcher._comm_manager._zc_bwd_token_buf
+        assert buf is not None, "zero-copy staging buffer not allocated before dispatch-backward"
+        assert (
+            buf.shape == grad.shape
+        ), f"dispatch-bwd grad {tuple(grad.shape)} != staging buffer {tuple(buf.shape)}"
+        buf.copy_(grad)
+        return buf, None
 
 
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
@@ -80,14 +200,37 @@ def make_viewless(e):
     return e
 
 
-@contextmanager
-def stream_acquire_context(stream, event):
-    """Stream acquire context"""
-    event.wait(stream)
+def set_ideal_affinity_for_current_gpu():
+    """Set CPU affinity for the current GPU to optimize host-device transfers."""
+    import uuid
+
     try:
-        yield
-    finally:
-        event.record(stream)
+        import cuda.bindings.driver as cuda_driver
+        import cuda.bindings.runtime as cuda_runtime
+    except:
+        try:
+            import cuda.cuda as cuda_driver
+            import cuda.cudart as cuda_runtime
+        except:
+            raise RuntimeError("Please install cuda-python to enable GPU affinity setting")
+    import pynvml
+
+    # Get current CUDA device ID
+    err, device_id = cuda_runtime.cudaGetDevice()
+    assert err == cuda_runtime.cudaError_t.cudaSuccess
+    # Get device UUID
+    err, device_uuid = cuda_driver.cuDeviceGetUuid(device_id)
+    assert err == cuda_driver.CUresult.CUDA_SUCCESS
+    # Set CPU affinity based on GPU's NUMA node
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))
+    pynvml.nvmlDeviceSetCpuAffinity(handle)
+
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        f"Set CPU affinity for all GPUs for optimal host-device transfer performance",
+    )
 
 
 class NoopScheduleNode:
@@ -123,12 +266,13 @@ class ScheduleNode:
         backward_func: Optional[Callable] = None,
         free_input: bool = False,
         name: str = "schedule_node",
+        ncclep_zero_copy: bool = False,
     ):
         """Initialize a schedule node.
 
         Args:
             forward_func (callable): Function to execute during the forward pass.
-            stream (torch.cuda.Stream): The CUDA stream for this node's computation.
+            stream (Callable): Func that returns CUDA stream for computation.
                 This can be either a 'compute' stream or a 'communicate' stream.
                 - 'compute' stream: Used for computational nodes like attention and experts.
                 - 'communicate' stream: Used for nodes that handle token communication,
@@ -137,8 +281,7 @@ class ScheduleNode:
                 microbatch within a model chunk shares the same event, which is used
                 to manage dependencies between nodes operating on different streams.
             backward_func (callable, optional): Function for the backward pass.
-            free_input (bool): Flag to indicate if the input should be freed after the
-                forward pass.
+            free_input (bool): Use a storage-free input-gradient wrapper after forward.
             name (str): Name of the node for debugging purposes.
         """
         self.name = name
@@ -147,23 +290,27 @@ class ScheduleNode:
         self.stream = stream
         self.event = event
         self.free_input = free_input
+        self.ncclep_zero_copy = ncclep_zero_copy
         self.inputs = None
-        self.outputs = None
-        self.delay_grads_release = False
-        self.manual_release_grads = False
+        self._output_edges = None
+        # When True, the forward runs under torch.no_grad() so no autograd graph is
+        # retained; the layer-level full recompute path replays it with grad at backward.
+        self.forward_no_grad = False
 
-    def default_backward_func(self, outputs, output_grad):
+    def default_backward_func(self, output_edges, output_grads):
         """Default backward function"""
-        Variable._execution_engine.run_backward(
-            tensors=outputs,
-            grad_tensors=output_grad,
-            keep_graph=False,
-            create_graph=False,
-            inputs=tuple(),
-            allow_unreachable=True,
-            accumulate_grad=True,
-        )
-        return output_grad
+        # The engine accepts GradientEdge roots despite the legacy `tensors` argument name.
+        if output_edges:
+            Variable._execution_engine.run_backward(
+                tensors=output_edges,
+                grad_tensors=output_grads,
+                keep_graph=False,
+                create_graph=False,
+                inputs=tuple(),
+                allow_unreachable=True,
+                accumulate_grad=True,
+            )
+        return output_grads
 
     def forward(self, inputs=()):
         """Schedule node forward"""
@@ -172,72 +319,93 @@ class ScheduleNode:
         return self._forward(*inputs)
 
     def _forward(self, *inputs):
-        with stream_acquire_context(self.stream, self.event):
-            torch.cuda.nvtx.range_push(f"{self.name} forward")
-            with torch.cuda.stream(self.stream):
-                self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
-                for i, input in enumerate(self.inputs):
-                    if input is not None:
-                        input.requires_grad = inputs[i].requires_grad
+        # Lazy initialization of stream
+        if isinstance(self.stream, Callable):
+            self.stream = self.stream()
+        with self.stream_acquire_context(f"{self.name} forward"):
+            self.inputs = []
+            real_inputs = []
+            for input in inputs:
+                if isinstance(input, torch.Tensor):
+                    real_input = make_viewless(input).detach()
+                    real_input.requires_grad_(input.requires_grad)
+                    # Backward releases retained inputs after enqueueing their kernels.
+                    # Protect every input until this consumer stream finishes, even
+                    # when the detached leaf keeps its storage through forward.
+                    input.record_stream(self.stream)
+                    if self.free_input:
+                        grad_source = ScheduleNodeInputWrapper(real_input)
+                        real_input = grad_source.unwrap_real_tensor()
+                    else:
+                        grad_source = real_input
+                    real_inputs.append(real_input)
+                    self.inputs.append(grad_source)
+                else:
+                    assert input is None, "ScheduleNode inputs must be tensors or None"
+                    real_inputs.append(None)
+                    self.inputs.append(None)
 
-                data = tuple(self.inputs)
+            data = tuple(real_inputs)
+            # Full recompute: skip the graph now, rebuild it by re-running at backward.
+            grad_ctx = torch.no_grad() if self.forward_no_grad else nullcontext()
+            with grad_ctx:
                 data = self.forward_func(*data)
 
-                if not isinstance(data, tuple):
-                    data = make_viewless(data)
+            if not isinstance(data, tuple):
+                data = make_viewless(data)
+            else:
+                data = tuple([make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data])
+
+            if self.forward_no_grad:
+                # no_grad does not make the output graph-free: forward_func may re-enter
+                # grad mode (TransformerLayer runs its bias-dropout-add under
+                # torch.enable_grad), and the output then carries a grad_fn that pins the
+                # tensors it was built from for as long as the output is retained, i.e.
+                # across the forward->backward gap when it becomes the next segment's input.
+                if isinstance(data, tuple):
+                    data = tuple(e.detach() if isinstance(e, torch.Tensor) else e for e in data)
                 else:
-                    data = tuple(
-                        [make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data]
-                    )
+                    data = data.detach()
 
-                self.output = data
-            torch.cuda.nvtx.range_pop()
-
-        # Immediately frees input tensors after they are used for nodes
-        # where inputs are no longer needed after computation.
-        if self.free_input:
-            for input in inputs:
-                if input is not None:
-                    input.record_stream(self.stream)
-                    input.untyped_storage().resize_(0)
-
-        return self.output
-
-    def get_output(self):
-        """Get the forward output"""
-        return self.output
-
-    def backward(self, output_grad):
-        """Schedule node backward"""
-        if not isinstance(output_grad, tuple):
-            output_grad = (output_grad,)
-        return self._backward(*output_grad)
-
-    def _backward(self, *output_grad):
-        with stream_acquire_context(self.stream, self.event):
-            torch.cuda.nvtx.range_push(f"{self.name} backward")
-            with torch.cuda.stream(self.stream):
-                outputs = self.output
-                if not isinstance(outputs, tuple):
-                    outputs = (outputs,)
-                assert len(outputs) == len(output_grad), (
-                    f"{len(outputs)} of {type(outputs[0])} is not equal to "
-                    f"{len(output_grad)} of {type(output_grad[0])}"
+            outputs = data if isinstance(data, tuple) else (data,)
+            self._output_edges = tuple(
+                (
+                    torch.autograd.graph.get_gradient_edge(output)
+                    if isinstance(output, torch.Tensor) and output.requires_grad
+                    else None
                 )
-                output_grad = self.backward_func(outputs, output_grad)
-            torch.cuda.nvtx.range_pop()
+                for output in outputs
+            )
 
-        # output_grad maybe from another stream
-        if output_grad:
-            for g in output_grad:
+        return data
+
+    def backward(self, output_grads):
+        """Schedule node backward"""
+        if not isinstance(output_grads, tuple):
+            output_grads = (output_grads,)
+        return self._backward(*output_grads)
+
+    def _backward(self, *output_grads):
+        # Lazy initialization of stream
+        if isinstance(self.stream, Callable):
+            self.stream = self.stream()
+        with self.stream_acquire_context(f"{self.name} backward"):
+            output_edges = self._output_edges
+            assert len(output_edges) == len(
+                output_grads
+            ), f"{len(output_edges)} outputs is not equal to {len(output_grads)} output gradients"
+            backward_pairs = tuple(
+                (edge, grad) for edge, grad in zip(output_edges, output_grads) if edge is not None
+            )
+            backward_edges = tuple(edge for edge, _ in backward_pairs)
+            backward_grads = tuple(grad for _, grad in backward_pairs)
+            grads_to_record = self.backward_func(backward_edges, backward_grads)
+
+        # Gradients may come from another stream.
+        if grads_to_record:
+            for g in grads_to_record:
                 if g is not None:
                     g.record_stream(self.stream)
-                    # Manually trigger the memory release of dgrad tensor
-                    # to avoid delayed garbage collection. If
-                    # delay_grads_release is True, dgrad is last used in
-                    # wgrad compute and skip the release here.
-                    if self.manual_release_grads and not self.delay_grads_release:
-                        g.untyped_storage().resize_(0)
 
         grads = self.get_grad()
         self._release_state()
@@ -246,16 +414,40 @@ class ScheduleNode:
 
     def get_grad(self):
         """Get the grad of inputs"""
-        grad = tuple([e.grad if e is not None else None for e in self.inputs])
+        grad = tuple(source.grad if source is not None else None for source in self.inputs)
         # multiple in, multiple out
         if len(grad) == 1:
             grad = grad[0]
         return grad
 
+    @contextmanager
+    def stream_acquire_context(self, name=None):
+        """Stream acquire context that handles event synchronization,
+            NVTX profiling, and stream context.
+
+        This context manager consolidates:
+        1. Event wait/record for synchronization between streams
+        2. NVTX range for profiling (if name is provided)
+        3. torch.cuda.stream context for execution on the specified stream
+
+        Args:
+            name: Optional name for NVTX range profiling
+        """
+        self.event.wait(self.stream)
+        if name:
+            nvtx_range_push(name)
+        try:
+            with torch.cuda.stream(self.stream):
+                yield
+        finally:
+            if name:
+                nvtx_range_pop(name)
+            self.event.record(self.stream)
+
     def _release_state(self):
         """Clear the state of the node"""
         self.inputs = None
-        self.output = None
+        self._output_edges = None
         del self.forward_func
         del self.backward_func
 
@@ -281,32 +473,29 @@ class AbstractSchedulePlan(ABC):
         ...
 
 
+_USE_DYNAMIC_COMP_STREAM = None
 _COMP_STREAM = None
 _COMM_STREAM = None
 
 
-def set_streams(comp_stream=None, comm_stream=None):
-    """Set the streams for communication and computation"""
-    global _COMP_STREAM
+def set_streams(comm_stream=None, high_priority=False):
+    """Set the stream for communication operations."""
     global _COMM_STREAM
-    if _COMP_STREAM is not None and _COMM_STREAM is not None:
-        return
 
-    if comp_stream is None:
-        comp_stream = torch.cuda.current_stream()
-    if comm_stream is None:
-        comm_stream = torch.cuda.Stream(device="cuda")
-
-    assert _COMP_STREAM is None
-    assert _COMM_STREAM is None
-    _COMP_STREAM = comp_stream
-    _COMM_STREAM = comm_stream
+    # Set communication stream
+    if _COMM_STREAM is None:
+        if comm_stream is None:
+            if high_priority:
+                _, high = torch.cuda.Stream.priority_range()
+                comm_stream = torch.cuda.Stream(device="cuda", priority=high)
+            else:
+                comm_stream = torch.cuda.Stream(device="cuda")
+        _COMM_STREAM = comm_stream
 
 
 def get_comp_stream():
     """Get the stream for computation"""
-    global _COMP_STREAM
-    return _COMP_STREAM
+    return torch.cuda.current_stream()
 
 
 def get_comm_stream():

@@ -2,37 +2,12 @@
 
 import asyncio
 import functools
-import importlib
-import os
-import sys
 import time
 import traceback
-from typing import Callable, Coroutine, Type
+from typing import Callable, Coroutine
 
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Self, Type
-
-
-def import_class(class_path: str) -> Type:
-    """Import a class from a string path.
-
-    Args:
-        class_path: String path to the class (e.g. 'examples.rl.environments.countdown.countdown_agent.CountdownAgent' or '../environments.countdown.py:CountdownAgent')
-
-    Returns:
-        The class object
-    """
-    if '.py:' in class_path:
-        # filepath.py:Classname branch.
-        module_path, class_name = class_path.split(':')
-        abs_path = os.path.abspath(module_path)
-        spec = importlib.util.spec_from_file_location('acemath_agent', abs_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-    else:
-        module_path, class_name = class_path.rsplit('.', 1)
-        module = importlib.import_module(module_path, package=__package__)
-    return getattr(module, class_name)
 
 
 class TypeLookupable(BaseModel, extra='allow'):
@@ -43,6 +18,11 @@ class TypeLookupable(BaseModel, extra='allow'):
     def unwrap(self) -> Self:
         """Turn instance of base class into registered subclass."""
         return type(self).Library.type_names[self.type_name](**self.model_dump())
+
+    @classmethod
+    def validate_registered(cls, payload: dict) -> Self:
+        """Validate a serialized instance as the registered subclass named by its type_name."""
+        return cls.Library.type_names[payload['type_name']].model_validate(payload)
 
     @classmethod
     def register_subclass(cls, register_type: Type[Self]) -> Type[Self]:

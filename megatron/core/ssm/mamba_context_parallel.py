@@ -1,10 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import copy
+from typing import Optional
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-from megatron.core.tensor_parallel import all_to_all
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
+from megatron.core.utils import is_te_min_version
 
 try:
     from einops import repeat
@@ -12,6 +16,16 @@ try:
     HAVE_EINOPS = True
 except ImportError:
     HAVE_EINOPS = False
+
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Alias the PyTorch wrapper so we can call tex.* APIs
+    import transformer_engine_torch as tex
+except ImportError:
+    # TE isn’t installed or the torch wrapper is missing
+    tex = None
 
 
 class MambaContextParallel:
@@ -34,14 +48,19 @@ class MambaContextParallel:
         nheads_local_tp (int): nheads on the current tp rank
         ngroups_local_tp (int): ngroups on the current tp rank
         d_state (int): Mamba d_state
-        conv1d_cp1 (nn.Conv1d):
-            The conv1d op which would be applied on this tp rank if cp_size was 1
+        conv1d_weight_cp1 (torch.Tensor):
+            The conv1d weight which would be used on this tp rank if cp_size was 1
+        conv1d_bias_cp1 (torch.Tensor):
+            The conv1d bias which would be used on this tp rank if cp_size was 1
+        conv1d_padding (int):
+            The conv1d padding which would be used on this tp rank if cp_size was 1
         dt_bias_cp1 (torch.Tensor):
             The dt_bias parameter which would be used on this tp rank if cp_size was 1
         A_log_cp1 (torch.Tensor):
             The A_log parameter which would be used on this tp rank if cp_size was 1
         D_cp1 (torch.Tensor): The D parameter which would be used on this tp rank if cp_size was 1
         D_has_hdim (bool): D parameter is sized to hidden dimension, rather than being per-head
+        sequence_is_contiguous (bool): Whether CP ranks already hold contiguous causal intervals.
     """
 
     def __init__(
@@ -51,11 +70,14 @@ class MambaContextParallel:
         nheads_local_tp: int,
         ngroups_local_tp: int,
         d_state: int,
-        conv1d_cp1: nn.Conv1d,
+        conv1d_weight_cp1: torch.Tensor,
+        conv1d_bias_cp1: torch.Tensor,
+        conv1d_padding: int,
         dt_bias_cp1: torch.Tensor,
         A_log_cp1: torch.Tensor,
         D_cp1: torch.Tensor,
         D_has_hdim: bool,
+        sequence_is_contiguous: bool = False,
     ) -> None:
         if not HAVE_EINOPS:
             raise ImportError("einops is required by the Mamba model but cannot be imported")
@@ -65,26 +87,36 @@ class MambaContextParallel:
         self.nheads_local_tp = nheads_local_tp
         self.ngroups_local_tp = ngroups_local_tp
         self.d_state = d_state
-        self.conv1d_cp1 = conv1d_cp1
+        self.conv1d_weight_cp1 = conv1d_weight_cp1
+        self.conv1d_bias_cp1 = conv1d_bias_cp1
+        self.conv1d_padding = conv1d_padding
         self.dt_bias_cp1 = dt_bias_cp1
         self.A_log_cp1 = A_log_cp1
         self.D_cp1 = D_cp1
         self.D_has_hdim = D_has_hdim
+        self.sequence_is_contiguous = sequence_is_contiguous
 
-        self.cp_size = self.cp_group.size()
+        self._set_cp_params()
+
+    def _set_cp_params(self) -> None:
+        """Recompute local dimensions after changing the runtime CP group."""
+        self.cp_size = self.cp_group.size() if self.cp_group is not None else 1
 
         if self.cp_size == 1:
+            self.cp_rank = 0
             self.d_inner_local_tpcp = self.d_inner_local_tp
             self.nheads_local_tpcp = self.nheads_local_tp
             self.ngroups_local_tpcp = self.ngroups_local_tp
+            self.group_repeat_count = 1
             return
 
         self.cp_rank = self.cp_group.rank()
 
         # Ensure that each CP rank gets at least one head:
-        assert (
-            self.nheads_local_tp % self.cp_size == 0
-        ), "nheads must be evenly divisible by tp_size * cp_size"
+        assert self.nheads_local_tp % self.cp_size == 0, (
+            f"TP-local head count {self.nheads_local_tp} must be divisible by "
+            f"runtime CP size {self.cp_size}"
+        )
         # Note that an upper-bound on cp_size is nheads // tp_size
         self.nheads_local_tpcp = self.nheads_local_tp // self.cp_size
 
@@ -96,16 +128,18 @@ class MambaContextParallel:
 
         # Ensure that each CP rank gets a positive integer number of groups:
         if self.ngroups_local_tp < self.cp_size:
-            assert (
-                self.cp_size % self.ngroups_local_tp == 0
-            ), "cp_size must be evenly divisible by ngroups/tp_size"
+            assert self.cp_size % self.ngroups_local_tp == 0, (
+                f"runtime CP size {self.cp_size} must be divisible by "
+                f"TP-local group count {self.ngroups_local_tp}"
+            )
             # Need to replicate the group state (shard the heads of each group) across CP ranks:
             self.group_repeat_count = self.cp_size // self.ngroups_local_tp
             self.ngroups_local_tpcp = 1
         else:
-            assert (
-                self.ngroups_local_tp % self.cp_size == 0
-            ), "ngroups must be evenly divisible by tp_size * cp_size"
+            assert self.ngroups_local_tp % self.cp_size == 0, (
+                f"TP-local group count {self.ngroups_local_tp} must be divisible by "
+                f"runtime CP size {self.cp_size}"
+            )
             # Group state is not replicted across CP ranks. All heads for any group are present on
             # one CP rank
             self.group_repeat_count = 1
@@ -116,7 +150,31 @@ class MambaContextParallel:
         # and also `nheads_local_tpcp = nheads_local_tp // cp_size` whilst ngroups_local_tpcp is
         # either 1 or `ngroups_local_tp // cp_size`
 
-    def pre_conv_ssm(self, input_: torch.Tensor) -> torch.Tensor:
+    def _set_context_parallel_group(
+        self, cp_group: Optional[torch.distributed.ProcessGroup]
+    ) -> None:
+        """Set the per-microbatch context-parallel group."""
+        self.cp_group = cp_group
+        self._set_cp_params()
+
+    def for_context_parallel_group(
+        self, cp_group: Optional[torch.distributed.ProcessGroup]
+    ) -> "MambaContextParallel":
+        """Return a forward-local view configured for ``cp_group``.
+
+        Parameters are shared with the build-time helper; only the derived CP
+        geometry is copied. This keeps concurrent autograd state independent
+        across microbatches that select different runtime CP sizes.
+        """
+        if cp_group is self.cp_group:
+            return self
+        runtime_view = copy.copy(self)
+        runtime_view._set_context_parallel_group(cp_group)
+        return runtime_view
+
+    def pre_conv_ssm(
+        self, input_: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> torch.Tensor:
         """Method to be applied before the convolution and SSM"""
         if self.cp_size == 1:
             return input_
@@ -170,37 +228,33 @@ class MambaContextParallel:
         dt = _all_to_all_cp2hp(dt, self.cp_group)
 
         output = torch.cat([z, x, B, C, dt], dim=-1)
-        # TODO(duncan): for hybrid models, consider isolating load-balancing to attention layers
-        output = _undo_attention_load_balancing(output, self.cp_size)
+        if not self.sequence_is_contiguous:
+            output = _undo_attention_load_balancing(output, self.cp_size, packed_seq_params)
 
         return output
 
-    def post_conv_ssm(self, input_: torch.Tensor) -> torch.Tensor:
+    def post_conv_ssm(
+        self, input_: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> torch.Tensor:
         """Method to be applied after the convolution and SSM"""
         if self.cp_size == 1:
             return input_
-        else:
-            return _all_to_all_hp2cp(
-                _redo_attention_load_balancing(input_, self.cp_size), self.cp_group
-            )
+        if not self.sequence_is_contiguous:
+            input_ = _redo_attention_load_balancing(input_, self.cp_size, packed_seq_params)
+        return _all_to_all_hp2cp(input_, self.cp_group)
 
     def conv1d(self, input_: torch.Tensor) -> torch.Tensor:
         """
         Performs a conv1d on one context parallel rank, using slices of the weight and bias from
         the convolution that would be run when cp_size=1
         """
-        if self.cp_size == 1:
-            return self.conv1d_cp1(input_)
-        else:
-            return F.conv1d(
-                input=input_,
-                weight=self.get_conv1d_weight(),
-                bias=self.get_conv1d_bias(),
-                stride=self.conv1d_cp1.stride,
-                padding=self.conv1d_cp1.padding,
-                dilation=self.conv1d_cp1.dilation,
-                groups=self.conv1d_channels(),  # in_channels == out_channels == groups
-            )
+        return F.conv1d(
+            input=input_,
+            weight=self.get_conv1d_weight(),
+            bias=self.get_conv1d_bias(),
+            padding=self.conv1d_padding,
+            groups=self.conv1d_channels(),  # in_channels == out_channels == groups
+        )
 
     # TODO(duncan): Make this a class instance variable?
     def conv1d_channels(self):
@@ -212,12 +266,12 @@ class MambaContextParallel:
     def get_conv1d_weight(self) -> torch.Tensor:
         """Returns a slice of the conv1d weight relevant to the current context parallel rank"""
         # weight shape: [conv_dim, 1, d_conv]
-        return self._slice_conv_param(self.conv1d_cp1.weight)
+        return self._slice_conv_param(self.conv1d_weight_cp1)
 
     def get_conv1d_bias(self) -> torch.Tensor:
         """Returns a slice of the conv1d bias relevant to the current context parallel rank"""
         # bias shape: [conv_dim]
-        return self._slice_conv_param(self.conv1d_cp1.bias)
+        return self._slice_conv_param(self.conv1d_bias_cp1)
 
     def get_dt_bias(self) -> torch.Tensor:
         """Returns a slice of dt_bias relevant to the current context parallel rank"""
@@ -281,7 +335,6 @@ class MambaContextParallel:
         return param[start:end]
 
 
-# TODO(duncan): Consider combining with all_to_all_sp2hp in mappings.py and using einops.rearrange
 def _all_to_all_cp2hp(
     input_: torch.Tensor, cp_group: torch.distributed.ProcessGroup
 ) -> torch.Tensor:
@@ -303,24 +356,12 @@ def _all_to_all_cp2hp(
     """
     assert input_.dim() == 3, "all_to_all_cp2hp assumes 3-d input shape."
     s_in, b_in, h_in = input_.shape
-    # Squash the first two dimensions -> [s*b, h]
-    input_ = input_.reshape(-1, h_in)
-    # Split into world_size chunks along the h dimension
-    world_size = cp_group.size()
-    h_out = h_in // world_size
-    split_tensors = torch.split(input_, split_size_or_sections=h_out, dim=1)
-    # Concat the chunks along the s*b dimension
-    concat_tensor = torch.cat(split_tensors, dim=0)
-    # TODO(duncan): Can the following be optimized by using the non-single (tensor list) version of
-    # all-to-all?
-    # Swap chunks of dim0 across the cp ranks
-    output = all_to_all(cp_group, concat_tensor)
-    # Recover the s and b dimensions
-    output = output.reshape(s_in * world_size, b_in, h_out)
+    s_out, h_out = s_in * cp_group.size(), h_in // cp_group.size()
+    output = all_to_all_sp2hp(input_, group=cp_group)
+    output = output.reshape(s_out, b_in, h_out)
     return output
 
 
-# TODO(duncan): Consider combining with all_to_all_hp2sp in mappings.py and using einops.rearrange
 def _all_to_all_hp2cp(
     input_: torch.Tensor, cp_group: torch.distributed.ProcessGroup
 ) -> torch.Tensor:
@@ -342,48 +383,84 @@ def _all_to_all_hp2cp(
     """
     assert input_.dim() == 3, "all_to_all_hp2cp assumes 3-d input shape."
     s_in, b_in, h_in = input_.shape
-    # Squash the first two dimensions -> [s*b, h]
-    input_ = input_.reshape(-1, h_in)
-    # Swap chunks of dim0 across the cp ranks
-    input_exchanged = all_to_all(cp_group, input_)
-    # Split into world_size chunks along the s*b dimension
-    world_size = cp_group.size()
-    s_out = s_in // world_size
-    split_tensors = torch.split(input_exchanged, split_size_or_sections=s_out * b_in, dim=0)
-    # Concat the chunks along the h dimension
-    output = torch.cat(split_tensors, dim=-1)
-    # Recover the s and b dimensions
-    output = output.reshape(s_out, b_in, h_in * world_size)
+    s_out, h_out = s_in // cp_group.size(), h_in * cp_group.size()
+    output = all_to_all_hp2sp(input_, group=cp_group)
+    output = output.reshape(s_out, b_in, h_out)
     return output
 
 
-def _undo_attention_load_balancing(input_: torch.Tensor, cp_size: int) -> torch.Tensor:
+def _undo_attention_load_balancing(
+    input_: torch.Tensor, cp_size: int, packed_seq_params: Optional[PackedSeqParams] = None
+) -> torch.Tensor:
     """
-    Undoes the context parallel attention load balancing
-    For example, for cp_size=3, converts 162534 to 123456 for sequential
-    processing by the convolution and SSM.
+    Undoes the context parallel attention load balancing.
+    For example (non-packed), for cp_size=3, converts 162534 to 123456 for
+    sequential processing by the convolution and SSM.
     """
-    num_chunks_div_2 = cp_size
-    num_chunks = num_chunks_div_2 * 2
-    chunks = torch.chunk(input_, chunks=num_chunks, dim=0)
-    order = [2 * i for i in range(num_chunks_div_2)] + [
-        num_chunks - 2 * i - 1 for i in range(num_chunks_div_2)
-    ]
-    reordered_chunks = [chunks[i] for i in order]
-    return torch.cat(reordered_chunks, dim=0)
+    if packed_seq_params is None:
+        num_chunks_div_2 = cp_size
+        num_chunks = num_chunks_div_2 * 2
+        chunks = torch.chunk(input_, chunks=num_chunks, dim=0)
+        order = [2 * i for i in range(num_chunks_div_2)] + [
+            num_chunks - 2 * i - 1 for i in range(num_chunks_div_2)
+        ]
+        reordered_chunks = [chunks[i] for i in order]
+        return torch.cat(reordered_chunks, dim=0)
+    else:
+        assert tex is not None and is_te_min_version("1.10.0"), (
+            "Please update Transformer Engine to >= 1.10 to use "
+            "Context Parallel with THD format data"
+        )
+        if packed_seq_params.cu_seqlens_q_padded is not None:
+            cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+        else:
+            cu_seqlens = packed_seq_params.cu_seqlens_q
+        total_tokens = input_.size(0)
+        assert total_tokens % cp_size == 0
+        seqlen_per_rank = total_tokens // cp_size
+        output = torch.empty_like(input_)
+        for cp_rank in range(cp_size):
+            start = cp_rank * seqlen_per_rank
+            end = start + seqlen_per_rank
+            index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+            output[index] = input_[start:end]
+        return output
 
 
-def _redo_attention_load_balancing(input_: torch.Tensor, cp_size: int) -> torch.Tensor:
+def _redo_attention_load_balancing(
+    input_: torch.Tensor, cp_size: int, packed_seq_params: Optional[PackedSeqParams] = None
+) -> torch.Tensor:
     """
-    Redo the context parallel attention load balancing
-    For example, for cp_size=3, converts 123456 to 162534 for efficient
-    processing by attention.
+    Redo the context parallel attention load balancing.
+    For example (non-packed), for cp_size=3, converts 123456 to 162534 for
+    efficient processing by attention.
     """
-    num_chunks_div_2 = cp_size
-    num_chunks = num_chunks_div_2 * 2
-    chunks = torch.chunk(input_, chunks=num_chunks, dim=0)
-    order = [None] * num_chunks
-    order[::2] = range(num_chunks_div_2)  # order[even]
-    order[1::2] = reversed(range(num_chunks_div_2, num_chunks))  # order[odd]
-    reordered_chunks = [chunks[i] for i in order]
-    return torch.cat(reordered_chunks, dim=0)
+    if packed_seq_params is None:
+        num_chunks_div_2 = cp_size
+        num_chunks = num_chunks_div_2 * 2
+        chunks = torch.chunk(input_, chunks=num_chunks, dim=0)
+        order = [None] * num_chunks
+        order[::2] = range(num_chunks_div_2)  # order[even]
+        order[1::2] = reversed(range(num_chunks_div_2, num_chunks))  # order[odd]
+        reordered_chunks = [chunks[i] for i in order]
+        return torch.cat(reordered_chunks, dim=0)
+    else:
+        assert tex is not None and is_te_min_version("1.10.0"), (
+            "Please update Transformer Engine to >= 1.10 to use "
+            "Context Parallel with THD format data"
+        )
+        if packed_seq_params.cu_seqlens_q_padded is not None:
+            cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+        else:
+            cu_seqlens = packed_seq_params.cu_seqlens_q
+        total_tokens = input_.size(0)
+        assert total_tokens % cp_size == 0
+        seqlen_per_rank = total_tokens // cp_size
+        index = torch.empty(total_tokens, device=input_.device, dtype=torch.int32)
+        for cp_rank in range(cp_size):
+            start = cp_rank * seqlen_per_rank
+            end = start + seqlen_per_rank
+            index[start:end] = tex.thd_get_partitioned_indices(
+                cu_seqlens, total_tokens, cp_size, cp_rank
+            )
+        return input_.index_select(0, index)

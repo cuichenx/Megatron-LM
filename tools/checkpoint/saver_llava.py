@@ -57,7 +57,7 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
             args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'expert_model_parallel_size', 'world_size', 'params_dtype',
                             'num_layers_per_virtual_pipeline_stage', 'virtual_pipeline_model_parallel_size',
                             'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
-                            'sequence_parallel', 'async_tensor_model_parallel_allreduce',
+                            'sequence_parallel',
                             'no_load_optim', 'no_load_rng', 'no_save_optim', 'no_save_rng',
                             'vocab_file',
                             'save_interval', 'save',
@@ -99,7 +99,6 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
                     '--no-masked-softmax-fusion',
                     '--no-bias-gelu-fusion',
                     '--no-bias-dropout-fusion',
-                    '--no-async-tensor-model-parallel-allreduce',
                     '--use-cpu-initialization',
                     '--micro-batch-size', '1',
                     '--no-load-optim',
@@ -160,6 +159,15 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
         margs.padded_vocab_size = self.md.padded_vocab_size
 
         return margs
+
+    def build_model_config(self):
+        """Select the same model family as this converter's provider."""
+        if self.md.model_type == "BERT":
+            return super().build_model_config()
+        from megatron.training.argument_utils import model_config_from_args
+        from megatron.training.models import LLaVAModelConfig
+
+        return model_config_from_args(self.margs, model_config_cls=LLaVAModelConfig)
 
     def import_model_provider(self):
         try:

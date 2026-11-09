@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from pathlib import Path
@@ -21,14 +21,17 @@ from megatron.core.num_microbatches_calculator import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.global_vars import set_args
+from megatron.training.global_vars import get_args, set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.dist_checkpointing.models.common import (
     common_test_parallel_reconfiguration_e2e,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
+
+pytestmark = pytest.mark.usefixtures("run_config")
 
 
 def initialize_gpt_model(
@@ -53,6 +56,8 @@ def initialize_gpt_model(
         virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
         hidden_dropout=0.0,
         attention_dropout=0.0,
+        mtp_num_layers=1 if with_mtp else None,
+        mtp_loss_scaling_factor=1.0 if with_mtp else None,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
@@ -61,9 +66,6 @@ def initialize_gpt_model(
         transformer_config.moe_ffn_hidden_size = 128
         transformer_config.num_moe_experts = 4
         transformer_config.add_bias_linear = False
-    if with_mtp:
-        transformer_config.mtp_num_layers = 1
-        transformer_config.mtp_loss_scaling_factor = 1.0
     model = []
     for i in range(virtual_pipeline_model_parallel_size or 1):
         if is_moe:
@@ -71,8 +73,16 @@ def initialize_gpt_model(
         else:
             layer_spec = layer_spec_fn()
 
-        if is_moe and with_mtp and mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i):
-            transformer_layer_spec_for_mtp = gpt_te_spec(transformer_config)
+        if with_mtp and mtp_on_this_rank(
+            layout=transformer_config.pipeline_model_parallel_layout,
+            mtp_num_layers=transformer_config.mtp_num_layers,
+            ignore_virtual=False,
+            vp_stage=i,
+        ):
+            if is_moe:
+                transformer_layer_spec_for_mtp = gpt_te_spec(transformer_config)
+            else:
+                transformer_layer_spec_for_mtp = layer_spec
             mtp_block_spec = get_gpt_mtp_block_spec(
                 transformer_config,
                 transformer_layer_spec_for_mtp,
@@ -81,6 +91,7 @@ def initialize_gpt_model(
             )
         else:
             mtp_block_spec = None
+
         pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
         post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
         this_model = (
@@ -122,7 +133,6 @@ def create_args():
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
     args.auto_detect_ckpt_format = False
-    args.retro_add_retriever = False
     args.ckpt_convert_update_legacy_dist_opt_format = False
     args.ckpt_step = None
     args.use_dist_ckpt = True
@@ -131,10 +141,12 @@ def create_args():
     args.consumed_valid_samples = 0
     args.vocab_file = None
     args.add_position_embedding = False
-    args.ckpt_assume_constant_structure = True
+    args.ckpt_assume_constant_structure = False
+    args.ckpt_load_validate_sharding_integrity = True
     args.dist_ckpt_strictness = "assume_ok_unexpected"
     args.fp16 = False
     args.bf16 = True
+    args.async_strategy = "nvrx"
     args.no_save_optim = True
     args.no_save_rng = True
     args.no_load_optim = True
@@ -143,6 +155,8 @@ def create_args():
     args.use_megatron_fsdp = False
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
+    args.phase_transition_iterations = None
+    args.verify_integrity = False
 
     yield args
 
@@ -162,7 +176,7 @@ def create_args():
                 [],
                 ["decoder"],
                 ["decoder"],
-                ["decoder"] * 2 + ["loss"],
+                ["decoder"] * 2 + ["mtp"] + ["loss"],
             ],
             False,
             True,
@@ -184,10 +198,24 @@ def create_args():
             False,
         ),
         ((1, 2, None), [["embedding"] + ["decoder"] * 4, ["decoder"] * 4 + ["loss"]], True, False),
-        ((1, 4, 2), "E|t*3|(t|)*5L", True, True),
+        ((1, 4, 2), "E|t*3|(t|)*5mL", True, True),  # mtp in the last stage
+        (
+            (1, 4, 2),
+            "E|t*3|(t|)*4tm|L",
+            True,
+            True,
+        ),  # mtp in the second last stage with a decoder layer
+        (
+            (1, 4, 2),
+            "E|t*3|(t|)*3tt|m|L",
+            True,
+            True,
+        ),  # mtp in the second last stage with no other layers
     ],
 )
-def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_moe, with_mtp):
+def test_forward_vpp(
+    create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_moe, with_mtp, run_config
+):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
     args = create_args
@@ -197,6 +225,7 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
     args.num_attention_heads = 8
     # Ckpt format
     args.ckpt_format = "torch_dist"
+    args.save_tokenizer_assets = False
     set_args(args)
 
     def set_tp_pp_vpp(tp, pp, vpp=None, pp_layout=None, destroy_first=True):
@@ -209,7 +238,9 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
         args.pipeline_model_parallel_layout = pp_layout
 
     set_tp_pp_vpp(*tp_pp_vpp, pp_layout=pp_layout, destroy_first=False)
-    init_num_microbatches_calculator(0, None, 1, 1, 1)
+    init_num_microbatches_calculator(
+        rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
+    )
 
     def forward_step_func(data_iterator, model: GPTModel):
         """Forward training step. Copied from `pretrain_gpt.py`"""
@@ -261,6 +292,7 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
     with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A') as ckpt_dir:
         args.save = ckpt_dir
         args.load = ckpt_dir
+        sync_checkpoint_config(get_args())
         save_checkpoint(
             iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
@@ -280,7 +312,14 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
             is_moe=is_moe,
             with_mtp=with_mtp,
         )
-        load_checkpoint([model_baseline], optimizer, opt_param_scheduler, strict=False)
+        sync_checkpoint_config(get_args())
+        load_checkpoint(
+            [model_baseline],
+            optimizer,
+            opt_param_scheduler,
+            strict=False,
+            restore_training_state=True,
+        )
 
         forward_backward_func = get_forward_backward_func()
         losses_reduced_baseline = forward_backward_func(

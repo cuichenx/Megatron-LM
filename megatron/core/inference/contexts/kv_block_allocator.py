@@ -1,0 +1,514 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+from typing import Callable, Optional, Tuple
+
+import numpy as np
+import torch
+from torch import Tensor
+
+from .moe_routing_replay import MoERoutingReplayCache
+from .prefix_cache_block_state import (  # noqa: F401 # pylint: disable=unused-import
+    MAX_CACHED_PROMPT_TOP_N_LOGPROBS,
+    PrefixCacheBlockState,
+    PromptLogprobsBlock,
+)
+from .prefix_cache_registry import PrefixCacheRegistry
+
+# Block deregistration observers are currently registered only by DynamoHelper.
+BlocksDeregisteredObserver = Callable[[list[int], set[int]], None]
+
+
+class KVBlockAllocator:
+    """Allocator that manages blocks of memory for the KV cache.
+
+    This allocator owns:
+
+    - The free-pool stack (`block_bag`, `pool_avail`).
+    - Allocation, release, retain, and reset orchestration.
+    - The MoE routing-replay per-block storage (`routing_replay`).
+
+    Args:
+        context (DynamicInferenceContext): Dynamic inference context.
+        pool_size (int): Number of blocks in the pool, including the dummy block.
+        paused_limit (int): Paused-request block retention limit. Must leave at
+            least one non-dummy block outside the limit.
+        pc_state (Optional[PrefixCacheBlockState]): Per-block prefix-caching state.
+            `None` disables prefix caching entirely on this allocator.
+        prefix_cache_registry (Optional[PrefixCacheRegistry]): Host hash registry shared
+            with the Mamba allocator. Given exactly when `pc_state` is given.
+    """
+
+    def __init__(
+        self,
+        context: "DynamicInferenceContext",
+        pool_size: int,
+        paused_limit: int,
+        pc_state: Optional[PrefixCacheBlockState] = None,
+        prefix_cache_registry: Optional[PrefixCacheRegistry] = None,
+    ):
+
+        self.context = context
+        assert (pc_state is None) == (
+            prefix_cache_registry is None
+        ), "pc_state and prefix_cache_registry must be given together"
+        if pc_state is not None:
+            assert pc_state.pool_size == pool_size, "pc_state must span the whole block pool"
+        self.pc_state = pc_state
+        self.registry = prefix_cache_registry
+        self._blocks_deregistered_observers: list[BlocksDeregisteredObserver] = []
+
+        # Handoff blocks remain pinned until decode finishes pulling them.
+        # Pinning at request finish only happens on engines with KV transfer
+        # configured (setup_kv_transfer flips this on); other engines have no
+        # release path for the pins.
+        self.enable_handoff_pinning = False
+
+        assert (
+            0 <= paused_limit <= pool_size - 2
+        ), "paused block limit must leave at least one usable block outside the limit"
+
+        self.pool_size = pool_size
+        self.pool_avail = pool_size - 1  # Raw free-pool count; -1 for dummy_block_idx.
+        self.paused_limit = paused_limit
+        self.dummy_block_idx = self.pool_size - 1
+
+        # Initialize block pool as a "stack" data structure (CPU for bookkeeping).
+        self.block_bag = torch.arange(self.pool_size, dtype=torch.int32, device='cpu')
+
+        # MoE routing-replay storage.
+        self.routing_replay = MoERoutingReplayCache(
+            block_size_tokens=context.block_size_tokens, dummy_block_idx=self.dummy_block_idx
+        )
+
+    @property
+    def enable_prefix_caching(self) -> bool:
+        """True when this allocator carries prefix-caching state."""
+        return self.pc_state is not None
+
+    def __str__(self):
+        return (
+            f"blocks: occupied {self.get_total_used()}/{self.pool_size - 1}"
+            f"; allocatable {self.get_allocatable_count()}"
+            f"; active-used {self.get_active_used()}"
+            f"; paused-used {self.get_paused_used()}/{self.paused_limit}"
+        )
+
+    def get_total_used(self):
+        """Compute number of physical blocks outside the free pool."""
+        return self.pool_size - self.pool_avail - 1
+
+    def get_active_used(self):
+        """Compute number of active blocks used."""
+        if self.pc_state is None:
+            return (
+                self.context.request_kv_block_counts[
+                    self.context.paused_request_count : self.context.total_request_count
+                ]
+                .sum()
+                .item()
+            )
+
+        active_start = self.context.paused_request_count
+        active_end = self.context.total_request_count
+        if active_end > active_start:
+            active_rows = self.context.request_to_kv_block_ids[active_start:active_end]
+            valid_ids = active_rows[active_rows >= 0]
+            if valid_ids.numel() > 0:
+                return int(torch.unique(valid_ids).numel())
+        return 0
+
+    def get_paused_used(self):
+        """Compute number of paused blocks used."""
+        if self.pc_state is None:
+            return (
+                self.context.request_kv_block_counts[: self.context.paused_request_count]
+                .sum()
+                .item()
+            )
+
+        if self.context.paused_request_count > 0:
+            paused_rows = self.context.request_to_kv_block_ids[: self.context.paused_request_count]
+            valid_ids = paused_rows[paused_rows >= 0]
+            if valid_ids.numel() > 0:
+                return int(torch.unique(valid_ids).numel())
+        return 0
+
+    def is_memory_available(self, num_blocks: int, potential_matched_count: int = 0) -> bool:
+        """Check if memory blocks are available.
+
+        Includes both free pool blocks and registered, evictable cached blocks.
+
+        Args:
+            num_blocks (int): Number of blocks to check.
+            potential_matched_count (int): Number of currently-evictable cached
+                blocks to subtract from the evictable count because the caller
+                will pin them before allocating (e.g. prefix-matched blocks that
+                get their ref counts bumped in add_request). These blocks are
+                ref_count == 0 now, so they are included in the evictable count,
+                but they will be protected from eviction, so they cannot supply
+                the requested ``num_blocks``.
+
+        Return:
+            (bool) Is memory available?
+        """
+        # Fast path: avoid computing the evictable count when the free pool
+        # suffices. Soon-to-be-pinned matches do not affect raw free capacity.
+        if self.pool_avail >= num_blocks:
+            return True
+        return self.get_allocatable_count() - potential_matched_count >= num_blocks
+
+    def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:
+        """Allocate memory blocks if available, else return None.
+
+        Under LRU prefix caching, falls back to evicting cached blocks when the free pool is short.
+        Returns `None` when even eviction cannot satisfy the request.
+
+        Args:
+            num_blocks (int): Number of blocks to allocate.
+
+        Return:
+            (Optional[Tensor]) Allocated block IDs.
+        """
+        # Try to evict cached blocks if free pool is insufficient.
+        if self.pool_avail < num_blocks:
+            if not self.evict_lru_blocks(num_blocks - self.pool_avail):
+                return None  # RZ / disabled: no eviction path; LRU: not enough cached blocks.
+
+        # Now allocate from the free pool
+        self.pool_avail -= num_blocks
+        block_ids = self.block_bag[self.pool_avail : (self.pool_avail + num_blocks)]
+        assert num_blocks == block_ids.numel()
+
+        if self.pc_state is not None:
+            self.pc_state.on_allocate(block_ids, self.context.prefix_cache_lru_clock)
+
+        # Clear stale per-block data for re-allocated blocks.
+        block_ids_list = block_ids.tolist()
+        self.routing_replay.clear_for_reallocated(block_ids_list)
+        if self.pc_state is not None:
+            for bid in block_ids_list:
+                self.pc_state.block_prompt_logprobs.pop(bid, None)
+
+        return block_ids
+
+    def release_memory_blocks(self, blocks: Tensor) -> None:
+        """Release memory blocks.
+
+        Without prefix caching: blocks return directly to the free pool.
+        With prefix caching: one reference per occurrence is dropped, and blocks that reach
+        zero are released according to the eviction policy (REF_ZERO deregisters them at
+        once; LRU keeps registered blocks cached and returns only unregistered ones).
+
+        Args:
+            blocks (Tensor): Block IDs to release.
+        """
+        if blocks.numel() == 0:
+            return
+
+        if self.pc_state is None:
+            self._push_to_pool(blocks)
+            return
+
+        pool_returns, hashes_to_drop = self.pc_state.on_release_compute_pool_returns(blocks)
+        self._push_to_pool(pool_returns)
+        if hashes_to_drop:
+            self._notify_deregistered(pool_returns, hashes_to_drop)
+
+    def retain_memory_blocks(self, block_ids: list[int]) -> None:
+        """Add one prefix-cache reference to each block.
+
+        Args:
+            block_ids: Blocks retained by a new owner.
+        """
+        assert self.pc_state is not None, "retaining KV blocks requires prefix caching"
+        if block_ids:
+            blocks = torch.tensor(block_ids, dtype=torch.int32, device='cpu')
+            self.pc_state.retain(blocks, self.context.prefix_cache_lru_clock)
+
+    def reset(self) -> None:
+        """Reset the allocator to initial state.
+
+        This resets the available block count to the entire memory pool
+        (except for the dummy block).
+        """
+
+        # Reset block bag to so we start consuming from the beginning of the pool
+        # for UVM performance.
+        # *Note*: Resetting the block bag is essential because if engine has been
+        # suspended, then the block bag contains non-unique IDs since the
+        # right-most IDs have been 'popped' off and are owned by the context.
+        # Without resetting the block bag, context request memory will clash and
+        # requests will point to each other's memory blocks, resulting in faulty
+        # generations.
+        # Refill the existing buffer so it remains mutable when reset runs under
+        # torch.inference_mode(), such as during CUDA graph setup.
+        torch.arange(self.pool_size, out=self.block_bag)
+
+        self.pool_avail = self.pool_size - 1
+
+        if self.pc_state is not None:
+            self.pc_state.reset()
+            self.registry.clear_kv()
+
+        # Clear per-block storage.
+        self.routing_replay.reset()
+
+    def _push_to_pool(self, blocks: Tensor) -> None:
+        """Push blocks back onto the free-pool stack."""
+        num_blocks = blocks.numel()
+        if num_blocks == 0:
+            return
+        self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = blocks
+        self.pool_avail += num_blocks
+
+    def _notify_deregistered(self, block_ids: Tensor, hashes: list[int]) -> None:
+        """Drop deregistered hashes from the registry, then notify the observers."""
+        keys_to_delete = set(hashes) - {-1}
+        self.registry.evict_kv(keys_to_delete)
+        block_ids_list = block_ids.tolist()
+        for observer in tuple(self._blocks_deregistered_observers):
+            observer(block_ids_list, keys_to_delete)
+
+    # =========================================================================
+    # Prefix caching methods
+    # =========================================================================
+
+    def register_kv_block_hashes(
+        self,
+        block_ids: list[int],
+        block_hashes: list[int],
+        parent_hashes: Optional[list[int]] = None,
+    ) -> list[int]:
+        """Register blocks in the hash-to-block mapping for discovery (batch).
+
+        Registration is idempotent: a block that already carries the hash being
+        registered is skipped. Callers may legitimately re-offer an already
+        registered block (a cache-matched block whose block-table slot a later
+        prefill chunk also spans), and the bookkeeping below is one-shot per
+        block -- applying it twice adds a second child entry to the block's
+        parent that no deregistration can ever cancel, leaving that parent
+        permanently short of ``child_count == 0`` and therefore never an
+        evictable leaf (see ``PrefixCacheBlockState.find_lru_evictable``).
+
+        Re-registering a live block under a *different* hash would instead
+        overwrite its recorded parent while leaving the previous parent's child
+        count raised, so that case is rejected rather than absorbed.
+
+        This method never touches reference counts. New blocks are pinned at
+        ``ref_count == 1`` by ``allocate_memory_blocks``, and additional owners
+        of an already registered block are pinned by the caller that matched it.
+
+        Args:
+            block_ids: List of block IDs.
+            block_hashes: List of computed hash values (same length as block_ids).
+            parent_hashes: Parent hash for each block in the prefix chain (same
+                length as block_ids); 0 marks a root block with no parent. Used
+                by LRU eviction to avoid evicting a parent before its children.
+                If None, parents default to 0.
+
+        Returns:
+            Newly registered block IDs, in input order. Already registered blocks
+            are excluded so callers can preserve their existing metadata.
+        """
+        if not block_ids:
+            return []
+        if parent_hashes is not None:
+            assert len(parent_hashes) == len(block_ids)
+
+        # Stamp the per-block shadow;
+        # this filters already-registered blocks and rejects hash changes on live blocks.
+        keep = self.pc_state.stamp_block_hashes(block_ids, block_hashes)
+        if len(keep) != len(block_ids):
+            if not keep:
+                return []
+            block_ids = [block_ids[i] for i in keep]
+            block_hashes = [block_hashes[i] for i in keep]
+            if parent_hashes is not None:
+                parent_hashes = [parent_hashes[i] for i in keep]
+
+        # Add the new blocks to the hash map first so that a block whose parent is
+        # elsewhere in this same batch (block k's parent is block k-1) resolves.
+        # Skipped blocks are already in the map, so they resolve as parents too.
+        self.registry.register_kv(block_ids, block_hashes)
+
+        if self.pc_state.is_lru:
+            # Persist the resolved parent block id and bump each parent's child count.
+            # Parents are earlier in the prefix chain and already registered
+            # (a matched block or a prior chunk / earlier entry in this batch),
+            # so a valid parent hash resolves; 0 marks a root and an unknown hash
+            # falls back to -1.
+            if parent_hashes is None:
+                parent_hashes = [0] * len(block_ids)
+            kv_map = self.registry.kv_hash_to_block_id
+            parent_ids = [kv_map.get(ph, -1) if ph != 0 else -1 for ph in parent_hashes]
+            self.pc_state.record_parent_chain(block_ids, parent_ids)
+        return block_ids
+
+    def add_blocks_deregistered_observer(self, observer: BlocksDeregisteredObserver) -> None:
+        """Register a callback invoked when cached blocks are deregistered.
+
+        Currently used only by DynamoHelper.
+        """
+        self._blocks_deregistered_observers.append(observer)
+
+    def get_evictable_block_count(self) -> Tensor:
+        """Get count of cached blocks that can be evicted (ref_count == 0, hash set).
+
+        Returns:
+            Scalar tensor with the number of evictable cached blocks.
+        """
+        return self.pc_state.get_evictable_block_count()
+
+    def get_allocatable_count(self) -> int:
+        """Compute the number of blocks available for allocation.
+
+        Includes both blocks in the free pool and, under LRU prefix caching,
+        registered ref-zero blocks that can be evicted.
+
+        Returns:
+            Number of blocks that can currently be allocated.
+        """
+        if self.pc_state is None:
+            return self.pool_avail
+        return self.pool_avail + self.pc_state.extra_blocks_available()
+
+    def evict_lru_blocks(self, num_blocks_needed: int) -> bool:
+        """Evict LRU cached blocks to free up space in the pool.
+
+        Args:
+            num_blocks_needed: Number of blocks to evict.
+
+        Returns:
+            True if enough blocks were evicted, False otherwise (also False without
+            prefix caching or under REF_ZERO, which keep no evictable reservoir).
+        """
+        if self.pc_state is None:
+            return False
+        result = self.pc_state.try_lru_evict_for_pool(num_blocks_needed)
+        if result is None:
+            return False
+        victims, hashes = result
+        self._push_to_pool(victims)
+        self._notify_deregistered(victims, hashes)
+        return True
+
+    # =========================================================================
+    # Per-block prompt log-prob storage (for prefix-cached prompt scoring)
+    # =========================================================================
+
+    def store_prompt_logprobs(
+        self,
+        block_ids: np.ndarray,
+        slots: np.ndarray,
+        log_probs: np.ndarray,
+        top_n_log_probs: np.ndarray,
+        top_n_token_ids: np.ndarray,
+        next_token_ids: np.ndarray,
+    ) -> None:
+        """Store prompt log-prob rows on the blocks that hold their source tokens.
+
+        A block keeps one top-N width. A wider write replaces it, and a narrower
+        write is dropped, so a block's rows only ever cover a superset of what an
+        earlier writer requested.
+
+        Args:
+            block_ids: Block ID of each row, shape `[R]`.
+            slots: Source position of each row within its block, shape `[R]`.
+            log_probs: Selected-token log-prob of each row, shape `[R]`.
+            top_n_log_probs: Top-N log-probs of each row, shape `[R, top_n]`.
+            top_n_token_ids: Top-N token IDs of each row, shape `[R, top_n]`.
+            next_token_ids: Token each row scores, used only for a block's final slot.
+        """
+        block_size = self.context.block_size_tokens
+        top_n = top_n_log_probs.shape[1]
+        for block_id in np.unique(block_ids).tolist():
+            entry = self.pc_state.block_prompt_logprobs.get(block_id)
+            if entry is None or entry.top_n < top_n:
+                entry = PromptLogprobsBlock(block_size, top_n)
+                self.pc_state.block_prompt_logprobs[block_id] = entry
+            elif entry.top_n > top_n:
+                continue
+            rows = block_ids == block_id
+            block_slots = slots[rows]
+            entry.log_probs[block_slots] = log_probs[rows]
+            entry.top_n_log_probs[block_slots] = top_n_log_probs[rows]
+            entry.top_n_token_ids[block_slots] = top_n_token_ids[rows]
+            entry.valid[block_slots] = True
+            final_slot = block_slots == block_size - 1
+            if final_slot.any():
+                entry.next_token_id = int(next_token_ids[rows][final_slot][0])
+
+    def match_prompt_logprob_blocks(
+        self, block_ids: list[int], first_block: int, prompt_tokens: Tensor, top_n: int
+    ) -> int:
+        """Count leading blocks whose cached prompt log-probs a request can reuse.
+
+        Args:
+            block_ids: Matched block IDs, in prefix order.
+            first_block: Request-relative index of the first matched block.
+            prompt_tokens: The request's full prompt.
+            top_n: Top-N width the request needs.
+
+        Returns:
+            int: Number of leading blocks with every row the request needs.
+        """
+        block_size = self.context.block_size_tokens
+        # A prompt of P tokens has P - 1 prompt scores, at source positions 0..P-2.
+        num_scores = len(prompt_tokens) - 1
+        entries = []
+        for block_id in block_ids:
+            entry = self.pc_state.block_prompt_logprobs.get(block_id)
+            if entry is None or entry.top_n < top_n:
+                break
+            entries.append(entry)
+        if not entries:
+            return 0
+
+        # A block's final slot scores the next block's first token. Gather those
+        # tokens in one transfer.
+        next_positions = [
+            (first_block + i + 1) * block_size
+            for i in range(len(entries))
+            if (first_block + i + 1) * block_size <= num_scores
+        ]
+        next_tokens = prompt_tokens[next_positions].tolist() if next_positions else []
+
+        for i, entry in enumerate(entries):
+            block_start = (first_block + i) * block_size
+            required_slots = min(block_size, num_scores - block_start)
+            if required_slots <= 0 or not entry.valid[:required_slots].all():
+                return i
+            if required_slots == block_size and entry.next_token_id != next_tokens[i]:
+                return i
+        return len(entries)
+
+    def read_prompt_logprobs(
+        self, block_ids: list[int], first_block: int, start: int, stop: int, top_n: int
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read cached prompt log-prob rows for source positions `[start, stop)`.
+
+        Args:
+            block_ids: Block IDs starting at request-relative block `first_block`.
+            first_block: Request-relative index of `block_ids[0]`.
+            start: First source position (inclusive).
+            stop: Last source position (exclusive).
+            top_n: Number of top alternatives to return per row.
+
+        Returns:
+            Selected log-probs `[N]`, top-N log-probs `[N, top_n]`, and top-N token IDs.
+        """
+        block_size = self.context.block_size_tokens
+        parts = ([], [], [])
+        position = start
+        while position < stop:
+            block_index = position // block_size
+            block_start = block_index * block_size
+            local_start = position - block_start
+            local_stop = min(block_size, stop - block_start)
+            entry = self.pc_state.block_prompt_logprobs[block_ids[block_index - first_block]]
+            assert entry.valid[local_start:local_stop].all()
+            parts[0].append(entry.log_probs[local_start:local_stop])
+            parts[1].append(entry.top_n_log_probs[local_start:local_stop, :top_n])
+            parts[2].append(entry.top_n_token_ids[local_start:local_stop, :top_n])
+            position = block_start + local_stop
+        return tuple(np.concatenate(part) for part in parts)

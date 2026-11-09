@@ -1,20 +1,23 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import copy
 import datetime
-import inspect
 import logging
 import math
 import os
 import random
 import re
 from collections import defaultdict
+from contextlib import contextmanager
 from enum import Enum
-from typing import Any, Callable, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import Any, Callable, Iterable, Iterator, List, NamedTuple, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
 
+from megatron.core._rank_utils import log_single_rank, safe_get_rank
 from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.typed_torch import copy_signature
 
 """DISCLAIMER: THIS IS AN EXPERIMENTAL FEATURE.
 
@@ -190,6 +193,8 @@ class RerunStateMachine:
     ) -> None:
         self.mode: RerunMode = mode
         self.state: RerunState = RerunState.NOT_RUNNING_YET
+        # Note: current_iteration is 0-indexed internally; all messages to
+        # stdout / stderr and the tracker file add 1 to display 1-indexed iterations.
         self.current_iteration: int = -1
         self.first_iteration_complete = False
         # The flags below are per-rank flags that get all-reduced across all ranks
@@ -202,6 +207,11 @@ class RerunStateMachine:
         # Request to resume normal execution when no HW fault was detected.
         self.continue_requested: bool = False
         self.logged_sdc_enabled: bool = False
+        # None means validation runs immediately. During CUDA graph capture, a list
+        # (initially empty) records tensor snapshots and validation arguments for
+        # host-side validation after replay.
+        self._captured_validation_calls: Optional[list[dict]] = None
+        self._deferred_validations: dict[str, list[dict]] = {}
 
         self.error_injector: RerunErrorInjector = error_injector or RerunErrorInjector()
         self.validation_counts: dict[Caller, int] = defaultdict(int)
@@ -234,14 +244,12 @@ class RerunStateMachine:
 
         self.saved_results: dict[Call, Any] = {}
         self.stats: dict[Caller, QuickStats] = defaultdict(lambda: QuickStats())
-        if _safe_get_rank() == 0:
-            logger.warning(f"RerunStateMachine initialized in mode {mode}")
+        log_single_rank(logger, logging.WARNING, f"RerunStateMachine initialized in mode {mode}")
 
     def set_mode(self, mode: RerunMode) -> None:
         """Method to set the operating mode"""
 
-        if _safe_get_rank() == 0:
-            logger.warning(f"Setting RerunStateMachine mode {mode}")
+        log_single_rank(logger, logging.WARNING, f"Setting RerunStateMachine mode {mode}")
         self.mode = mode
 
     def get_mode(self) -> RerunMode:
@@ -328,7 +336,7 @@ class RerunStateMachine:
             if not will_rerun:
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
-            if self.mode == RerunMode.VALIDATE_RESULTS and _safe_get_rank() == 0:
+            if self.mode == RerunMode.VALIDATE_RESULTS and safe_get_rank() == 0:
                 logger.warning("Need to rerun step to check reproducibility of initial result")
             self.state = RerunState.RERUNNING_IN_PLACE
             self._restore_state()
@@ -353,10 +361,11 @@ class RerunStateMachine:
                 [self.continue_requested, self.checkpoint_requested]
             )
             if will_continue:
-                if _safe_get_rank() == 0:
-                    logger.warning(
-                        "Continuing normal execution because failed validation was not fatal"
-                    )
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "Continuing normal execution because failed validation was not fatal",
+                )
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
             if will_checkpoint:
@@ -376,18 +385,20 @@ class RerunStateMachine:
                 [self.restart_again_requested, self.continue_requested]
             )
             if will_restart_again:
-                if _safe_get_rank() == 0:
-                    logger.warning(
-                        "Need to restart job from the same checkpoint "
-                        "because it was scheduled on the same node/GPU"
-                    )
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "Need to restart job from the same checkpoint "
+                    "because it was scheduled on the same node/GPU",
+                )
                 self.state = RerunState.RERUNNING_AGAIN_FROM_CHECKPOINT
             else:
                 if will_continue:
-                    if _safe_get_rank() == 0:
-                        logger.warning(
-                            "Continuing normal execution because failed validation was not fatal"
-                        )
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        "Continuing normal execution because failed validation was not fatal",
+                    )
                     self.state = RerunState.NOT_RUNNING_YET
             return False
         raise RuntimeError("Should not be here")
@@ -423,35 +434,67 @@ class RerunStateMachine:
         if self.mode in [RerunMode.DISABLED, RerunMode.REPORT_DETERMINISM_STATS]:
             return False, False, 0
         if self.state == RerunState.RERUNNING_IN_PLACE:
-            if _safe_get_rank() == 0:
-                logger.warning(
-                    "Exiting now. A checkpoint at the last iteration is being saved "
-                    "if further examination is needed"
-                )
-            return True, True, EXIT_CODE_FAILED_ON_RESULT_VALIDATION
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Exiting now. The job can be resumed from a previous checkpoint",
+            )
+            return False, True, EXIT_CODE_FAILED_ON_RESULT_VALIDATION
         elif self.state == RerunState.WILL_RERUN_FROM_CHECKPOINT:
-            if _safe_get_rank() == 0:
-                logger.warning(
-                    "Saving a checkpoint and exiting now. Please resume the job "
-                    "from the checkpoint to rerun the last iteration "
-                    "and establish a diagnostic"
-                )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Saving a checkpoint and exiting now. Please resume the job "
+                "from the checkpoint to rerun the last iteration "
+                "and establish a diagnostic",
+            )
             return True, True, EXIT_CODE_RESUME_TO_DISAMBIGUATE
         elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
-            if _safe_get_rank() == 0:
-                logger.warning(
-                    "Exiting now. A checkpoint at the last iteration already exists "
-                    "if further examination is needed"
-                )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Exiting now. A checkpoint at the last iteration already exists "
+                "if further examination is needed",
+            )
             return False, True, EXIT_CODE_FAILED_ON_RESULT_VALIDATION
         elif self.state == RerunState.RERUNNING_AGAIN_FROM_CHECKPOINT:
-            if _safe_get_rank() == 0:
-                logger.warning(
-                    "Exiting now. Please resume the job from the same checkpoint "
-                    "to rerun the last iteration and establish a diagnostic"
-                )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Exiting now. Please resume the job from the same checkpoint "
+                "to rerun the last iteration and establish a diagnostic",
+            )
             return False, True, EXIT_CODE_RESUME_TO_DISAMBIGUATE
         return False, False, 0
+
+    @contextmanager
+    def capture_deferred_validations(self, key: str) -> Iterator[None]:
+        """Record validations for a graph, replacing any previous capture under ``key``.
+
+        Capture the value at its original validation site, before later in-place
+        operations can change it. Call ``run_deferred_validations(key)`` after each
+        replay, before deciding whether to rerun or update the optimizer.
+        """
+        if self._captured_validation_calls is not None:
+            raise RuntimeError("Result-validation capture cannot be nested")
+        self._deferred_validations[key] = []
+        self._captured_validation_calls = self._deferred_validations[key]
+        try:
+            yield
+        except BaseException:
+            self.clear_deferred_validations(key)
+            raise
+        finally:
+            self._captured_validation_calls = None
+
+    def run_deferred_validations(self, key: str) -> None:
+        """Validate replayed snapshots without allowing later replays to overwrite saved results."""
+        for validation in self._deferred_validations.get(key, []):
+            self.validate_result(**{**validation, "result": validation["result"].clone()})
+
+    def clear_deferred_validations(self, key: str) -> None:
+        """Release the snapshots and callbacks owned by a graph that is being reset."""
+        self._deferred_validations.pop(key, None)
 
     def validate_result(
         self,
@@ -506,6 +549,21 @@ class RerunStateMachine:
           verifying the result is the same.
         """
 
+        if self._captured_validation_calls is not None:
+            if not isinstance(result, torch.Tensor) or not result.is_cuda:
+                raise TypeError("Full-graph result validation requires a CUDA tensor result")
+            self._captured_validation_calls.append(
+                dict(
+                    result=result.detach().clone(),
+                    rejection_func=rejection_func,
+                    message=message,
+                    comparison_func=comparison_func,
+                    tolerance=tolerance,
+                    fatal=fatal,
+                )
+            )
+            return
+
         # If reruns are disabled, still validate the result and throw a RuntimeError if it is
         # rejected when fatal. This is a backward-compatible behavior for infs and NaNs.
         if self.mode == RerunMode.DISABLED:
@@ -514,12 +572,12 @@ class RerunStateMachine:
                 self._log_validation_error_to_file(
                     status=RerunValidationStatus.RERUN_DISABLED, result=result, message=message
                 )
-                rank: int = _safe_get_rank()
+                rank: int = safe_get_rank()
                 node: str = os.uname()[1]
                 device: int = torch.cuda.current_device()
                 full_message: str = (
                     f"Rank {rank}, node {node}, device {device}, "
-                    f"iteration {self.current_iteration}: "
+                    f"iteration {self.current_iteration + 1}: "
                     f"Unexpected result {result} (message='{message}')"
                 )
                 if fatal:
@@ -556,18 +614,18 @@ class RerunStateMachine:
             return
 
         def log_failure(message: str, fatal: bool = True) -> None:
-            rank: int = _safe_get_rank()
+            rank: int = safe_get_rank()
             node: str = os.uname()[1]
             device: int = torch.cuda.current_device()
             if fatal:
                 logger.error(
                     f"Rank {rank}, node {node}, device {device}, "
-                    f"iteration #{self.current_iteration}: {message}!"
+                    f"iteration #{self.current_iteration + 1}: {message}!"
                 )
             else:
                 logger.warning(
                     f"Rank {rank}, node {node}, device {device}, "
-                    f"iteration #{self.current_iteration}: {message}!"
+                    f"iteration #{self.current_iteration + 1}: {message}!"
                 )
 
         # Emit message in log so that we can identify which jobs have this instrumentation
@@ -575,8 +633,7 @@ class RerunStateMachine:
         # the check_for_nan_in_loss_and_grad option but never call validate_result.
         if not self.logged_sdc_enabled:
             self.logged_sdc_enabled = True
-            if _safe_get_rank() == 0:
-                logger.warning("Result validation enabled")
+            log_single_rank(logger, logging.WARNING, "Result validation enabled")
 
         # If this the initial run of the iteration, and no unexpected result has already been
         # identified?
@@ -597,8 +654,8 @@ class RerunStateMachine:
                 )
                 logger.error(
                     f"Unexpected result {result} "
-                    f"on rank {_safe_get_rank()} "
-                    f"at iteration #{self.current_iteration} "
+                    f"on rank {safe_get_rank()} "
+                    f"at iteration #{self.current_iteration + 1} "
                     f"invocation #{validation_call.sequence} "
                     f"(message='{message}')"
                 )
@@ -767,8 +824,13 @@ class RerunStateMachine:
             data_iterator: the data iterator that needs to be checkpointed (or None
                 if this checkpoint is not requested by the rerun state machine).
             ckpt_format: the checkpoint format to use.
+            force: if True, emit the full state dict even when the machine is
+                disabled or no rerun is pending (used on the load path to
+                build a matching template).
         Returns:
-            A state dict representing the rerun state machine.
+            A state dict representing the rerun state machine, or None if
+            rerun checkpointing is not applicable (mode is DISABLED, or the
+            checkpoint format does not support ShardedObject).
 
         Example usage:
 
@@ -783,24 +845,49 @@ class RerunStateMachine:
                 return checkpoint
         """
 
-        # Only save a checkpoint if a step needs to be rerun.
+        # Short-circuits only apply on the save path. On the load path
+        # (``force=True``) we build a template that mirrors whatever the
+        # checkpoint happens to contain, regardless of the current mode or
+        # ckpt_format -- this preserves the behavior the load path in
+        # ``checkpointing.py`` has always relied on.
         if not force:
-            if self.state == RerunState.NOT_RUNNING_YET:
+            # Disabled mode never triggers a rerun workflow, so there's
+            # nothing to persist across a restart; keep returning None to
+            # avoid bloating the checkpoint.
+            if self.mode == RerunMode.DISABLED:
                 return None
-
+            # ShardedObject is only supported by the torch_dist format.
             if ckpt_format != "torch_dist":
-                if _safe_get_rank() == 0:
-                    logger.warning(
-                        "RerunStateMachine checkpoints ONLY SUPPORTED "
-                        "for checkpoint format torch_dist"
-                    )
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "RerunStateMachine checkpoints ONLY SUPPORTED "
+                    "for checkpoint format torch_dist",
+                )
                 return None
 
-        data_iterators: list[RerunDataIterator] = self._sanitize_data_iterators(data_iterator)
+        # Data-iterator buffers only need to be checkpointed when a rerun is
+        # actually pending. In steady state we skip sanitization so the
+        # caller isn't required to have wrapped its iterator in
+        # ``RerunDataIterator`` -- that requirement only applies when a
+        # fault is mid-flight.
+        if self.state == RerunState.NOT_RUNNING_YET and not force:
+            data_iterator_checkpoints = None
+        else:
+            data_iterators: list[RerunDataIterator] = self._sanitize_data_iterators(data_iterator)
+            data_iterator_checkpoints = (
+                [d.state_dict() for d in data_iterators] if data_iterators else None
+            )
 
         # When saving a step to re-run, the RerunStateMachine state is different across all ranks.
         # We keep the common state in the non-sharded (common) checkpoint and move the rank-level
         # state to a sharded object.
+        # In NOT_RUNNING_YET this is all zero/None defaults (a sentinel);
+        # in WILL_RERUN_FROM_CHECKPOINT it carries the real fault context. The
+        # ShardedObject key/shape/offset are identical in both cases. This keeps the
+        # checkpoint's sharded structure constant across saves (a
+        # requirement of ``--ckpt-assume-constant-structure``)
+        # For details, see GitHub issue NVIDIA/Megatron-LM#4378.
         sharded_dict = {
             "rerun_requested": self.rerun_requested,
             "checkpoint_requested": self.checkpoint_requested,
@@ -814,9 +901,7 @@ class RerunStateMachine:
             "suspicious_node": self.suspicious_node,
             "suspicious_device": self.suspicious_device,
             # No need to save saved_state (RNG state  already captured in checkpoint).
-            "data_iterator_checkpoints": (
-                [d.state_dict() for d in data_iterators] if data_iterators else None
-            ),
+            "data_iterator_checkpoints": data_iterator_checkpoints,
             "large_value_counts": self.large_value_counts,
             "max_values": self.max_values,
             # No need to save saved_results and stats (resets when job resumes).
@@ -871,13 +956,17 @@ class RerunStateMachine:
         """
 
         if self.mode == RerunMode.DISABLED:
-            if _safe_get_rank() == 0:
-                logger.warning(
-                    "RerunStateMachine disabled via CLI, ignoring machine state saved in checkpoint"
-                )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "RerunStateMachine disabled via CLI, ignoring machine state saved in checkpoint",
+            )
             return
-        if _safe_get_rank() == 0:
-            logger.warning("Getting RerunStateMachine state from checkpoint. Will rerun step.")
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "Getting RerunStateMachine state from checkpoint. Will rerun step.",
+        )
         self.mode = state_dict["mode"]
         self.current_iteration = state_dict["current_iteration"]
         self.state = state_dict["state"]
@@ -916,14 +1005,7 @@ class RerunStateMachine:
     def _get_validation_call_info(self, message: str) -> Call:
         """Internal method to get the context about the caller to validate_result()."""
 
-        frame = inspect.currentframe()
-        assert frame is not None
-        assert frame.f_back is not None
-        frame = frame.f_back.f_back
-        assert frame is not None
-        filename: str = inspect.getframeinfo(frame).filename
-        lineno: int = frame.f_lineno
-        rank: int = _safe_get_rank()
+        rank: int = safe_get_rank()
         caller = Caller(message=message, rank=rank)
         self.validation_counts[caller] += 1
         sequence: int = self.validation_counts[caller]
@@ -977,7 +1059,7 @@ class RerunStateMachine:
                         self.stats[caller].combine(
                             [s.get(caller) for s in stats_list[1:] if s.get(caller)]
                         )
-                        logger.info(f"  From {caller.filename}, line {caller.lineno}:")
+                        logger.info(f"  From validation call '{caller.message}':")
                         logger.info(f"    {self.stats[caller].print_stats()}")
                 else:
                     for caller, stats in self.stats.items():
@@ -985,7 +1067,7 @@ class RerunStateMachine:
             else:
                 logger.info("Stats on computation determinism in validation calls")
                 for caller, stats in self.stats.items():
-                    logger.info(f"  From {caller.filename}, line {caller.lineno}:")
+                    logger.info(f"  From validation call '{caller.message}':")
                     logger.info(f"    {stats.print_stats()}")
 
     def _log_validation_error_to_file(
@@ -994,14 +1076,14 @@ class RerunStateMachine:
         if self.result_rejected_tracker_filename is not None:
             # Append to log.
             try:
-                rank: int = _safe_get_rank()
+                rank: int = safe_get_rank()
                 node: str = os.uname()[1]
                 device: int = torch.cuda.current_device()
                 with open(self.result_rejected_tracker_filename, "a") as f:
                     f.write(
                         f"ts={datetime.datetime.now()} node={node} device={device} "
                         f"jobID={os.getenv('SLURM_JOBID', 'N/A')} rank={rank} "
-                        f"iteration={self.current_iteration} status={status} result={result} "
+                        f"iteration={self.current_iteration + 1} status={status} result={result} "
                         f"message='{message}'\n"
                     )
             except Exception as e:
@@ -1057,13 +1139,21 @@ class RerunStateMachine:
                             if len(iterations_seen_by_job[job][iteration]) > 1:
                                 iterations_to_ignore.add(iteration)
         except Exception as e:
-            logger.error(f"Could not parse iterations to skip in tracker file! ({e})")
+            log_single_rank(
+                logger, logging.ERROR, f"Could not parse iterations to skip in tracker file! ({e})"
+            )
         iterations_to_skip = sorted(iterations_to_potentially_skip - iterations_to_ignore)
-        logger.warning(f"Will skip these iterations from tracker file: {iterations_to_skip}")
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"Will skip these iterations from tracker file: {iterations_to_skip}",
+        )
         if len(iterations_to_ignore) > 0:
-            logger.warning(
+            log_single_rank(
+                logger,
+                logging.WARNING,
                 "Will not skip these iterations due to multiple rank errors: "
-                f"{sorted(iterations_to_ignore)}"
+                f"{sorted(iterations_to_ignore)}",
             )
         return iterations_to_skip
 
@@ -1105,7 +1195,9 @@ class RerunDataIterator:
             return n
         n = next(self.iterable)
         if get_rerun_state_machine().get_mode() != RerunMode.DISABLED:
-            self.saved_microbatches.append(n)
+            # Shallow-copy so downstream dict-entry mutations do not
+            # corrupt the saved snapshot used for replay.
+            self.saved_microbatches.append(copy.copy(n))
         return n
 
     def rewind(self) -> None:
@@ -1254,7 +1346,7 @@ class RerunErrorInjector:
         if not self.should_inject_errors or self.injected_error_type is not None:
             return False
         r: int = (
-            random.randint(0, self.error_injection_rate - 1) + _safe_get_rank()
+            random.randint(0, self.error_injection_rate - 1) + safe_get_rank()
         ) % self.error_injection_rate
         if r != 0:
             return False
@@ -1320,13 +1412,14 @@ class RerunErrorInjector:
         self.injected_error_type = state_dict["injected_error_type"]
 
 
-def initialize_rerun_state_machine(**kwargs) -> None:
+@copy_signature(RerunStateMachine.__init__, handle_first_src_param='skip')
+def initialize_rerun_state_machine(*args, **kwargs) -> None:
     """Helper function to initialize the rerun machine instance.
 
     Check the RerunStateMachine class for the details.
     """
 
-    rerun_state_machine: RerunStateMachine = RerunStateMachine(**kwargs)
+    rerun_state_machine: RerunStateMachine = RerunStateMachine(*args, **kwargs)
     _set_rerun_state_machine(rerun_state_machine)
 
 
@@ -1341,7 +1434,7 @@ def get_rerun_state_machine() -> RerunStateMachine:
     """Helper function to return the singleton instance of the rerun machine."""
 
     if _GLOBAL_RERUN_STATE_MACHINE is None:
-        logger.warning("Implicit initialization of Rerun State Machine!")
+        log_single_rank(logger, logging.WARNING, "Implicit initialization of Rerun State Machine!")
         initialize_rerun_state_machine()
         assert _GLOBAL_RERUN_STATE_MACHINE is not None
     return _GLOBAL_RERUN_STATE_MACHINE
@@ -1353,19 +1446,6 @@ def _set_rerun_state_machine(rerun_state_machine) -> None:
     global _GLOBAL_RERUN_STATE_MACHINE
     assert _GLOBAL_RERUN_STATE_MACHINE is None, "Rerun state machine is already initialized"
     _GLOBAL_RERUN_STATE_MACHINE = rerun_state_machine
-
-
-def _safe_get_rank() -> int:
-    """Internal function that safely checks and returns the rank of the caller."""
-
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_rank()
-
-    # If torch.distributed is not initialized, try to read environment variables.
-    try:
-        return int(os.environ.get("RANK", 0))
-    except (ValueError, TypeError):
-        return 0
 
 
 def _compare_floats(a: torch.Tensor, b: torch.Tensor) -> float:

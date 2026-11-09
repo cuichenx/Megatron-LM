@@ -1,7 +1,9 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron Module."""
-from typing import Optional, Tuple
+
+from functools import partial
+from typing import Any, Optional, Tuple
 
 import torch
 from torch.autograd import Variable
@@ -21,8 +23,44 @@ _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
 
 
+class TwoStageAttentionLayer:
+    """Interface for attention-like modules that expose core and post-core stages."""
+
+    def supports_two_stage_attention(self) -> bool:
+        """Return whether this module instance supports two-stage execution."""
+        return True
+
+    def forward_pre_attn_and_core_attn(
+        self, *args: Any, packed_sequence_cp_metadata: Any = None, **kwargs: Any
+    ) -> Any:
+        """Run the pre-attention and core-attention stage."""
+        raise NotImplementedError
+
+    def forward_post_core_attn(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the post-core-attention stage."""
+        raise NotImplementedError
+
+
 def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
     return not hasattr(param, 'shared') or not param.shared
+
+
+def is_first_microbatch_tracked(config) -> bool:
+    """True if ``is_first_microbatch`` is still being kept up to date.
+
+    A training step runs N microbatches. The flag marks microbatch 1 -- the one that
+    re-quantizes the weights and starts a fresh main_grad, while 2..N reuse and accumulate::
+
+        layer is built      ->  flag = True
+        every forward       ->  flag = False   (microbatch 1 is over)
+        start of each step  ->  flag = True    (only quantized configs)
+    """
+    return (
+        config.fp8 is not None
+        or config.fp4 is not None
+        or getattr(config, 'use_kitchen', False)
+        or getattr(config, 'quant_recipe', None) is not None
+    )
 
 
 class MegatronModule(torch.nn.Module):
@@ -39,6 +77,14 @@ class MegatronModule(torch.nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
+
+    def refresh_cache(self) -> None:
+        """Refresh state derived from parameters after an in-place weight refit.
+
+        Refit bypasses the normal checkpoint-load and train/eval lifecycles. Modules
+        that cache values derived from parameters can override this method; the refit
+        receiver calls it after all parameter and buffer transfers have completed.
+        """
 
     def state_dict_for_save_checkpoint(self, prefix: str = '', keep_vars: bool = False):
         """Override state dict for saving checkpoints Use this function to override the
@@ -105,12 +151,9 @@ class MegatronModule(torch.nn.Module):
         """Sets the is_first_microbatch flag if it exists and config.fp8==True.
         When this flag is set, TE modules will update their fp8 parameter cache.
         If kitchen is being used, kitchen controls quantization level.
+        A quant_recipe (e.g. from --te-precision-config-file) also enables the flag.
         """
-        if (
-            self.config.fp8 is not None
-            or self.config.fp4 is not None
-            or getattr(self.config, 'use_kitchen', False)
-        ):
+        if is_first_microbatch_tracked(self.config):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []
                 for m in self.modules():
@@ -168,9 +211,12 @@ class GraphableMegatronModule(MegatronModule):
 
         # Enable cuda graphs.
         if config.cuda_graph_impl == "local":
-            from megatron.core.transformer.cuda_graphs import CudaGraphManager
+            if hasattr(self, "create_mcore_cudagraph_manager"):
+                self.create_mcore_cudagraph_manager(config)
+            else:
+                from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-            self.cudagraph_manager = CudaGraphManager(config, vp_stage=vp_stage)
+                self.cudagraph_manager = CudaGraphManager(config)
         elif config.cuda_graph_impl == "transformer_engine":
             # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
             # the number of microbatches. Multiple CUDA graphs per layer is required to support
@@ -184,6 +230,65 @@ class GraphableMegatronModule(MegatronModule):
             # triggered before CUDA Graph running. This is required to ensure the correct param
             # all-gather overlap with forward compute.
             self.cuda_graph_manual_hooks = []
+            # _CudaGraphBackwardDWWrapper object used to manage the wgrad backward computation.
+            # The `backward_dw` func api is the same as `TransformerLayerNode.backward_dw` and
+            # calls wgrad computation in attention module (contains attn and shared expert)
+            # according to CUDA graph scope.
+            self.cuda_graph_backward_dw_wrapper = None
+
+    def init_backward_dw_wrapper(self):
+        """Initialize ``self.backward_dw_wrapper`` for delayed-wgrad scheduling.
+
+        The wrapper coordinates the per-layer wgrad callables (attention
+        wgrad, optional shared-expert wgrad) with cuda-graph replay scope so
+        captured components are not re-run eagerly. The method is defined on
+        ``GraphableMegatronModule`` so any graphable subclass can opt in;
+        ``_BackwardDWWrapper`` itself currently asserts the underlying layer
+        is a ``TransformerLayer``, so MambaLayer-derived modules implement
+        ``backward_dw`` directly and skip this helper.
+        """
+        from megatron.core.models.common.utils import _BackwardDWWrapper
+
+        config = getattr(self, 'config', None)
+        assert config is not None, (
+            "Module must be fully constructed (config set) before calling "
+            "`init_backward_dw_wrapper`."
+        )
+        self.backward_dw_wrapper = _BackwardDWWrapper(self)
+
+    def set_te_cuda_graph_backward_dw_wrapper(self):
+        """Replace the backward_dw callable with dw cuda graph."""
+        assert (
+            self.backward_dw_wrapper is not None
+        ), "`backward_dw_wrapper` must be set when cuda graphs are enabled for ep overlap."
+        self.backward_dw_wrapper.set_graphed_backward_dw_callable(
+            partial(self._te_cuda_graph_backward_dw_graph, self.current_microbatch)
+        )
+
+    def _te_cuda_graph_index(self, microbatch_idx):
+        """Select the replay slot shared by forward and deferred weight gradients."""
+        if (
+            self.config.sequence_packing_scheduler == "dp_balanced"
+            and self.config.cuda_graph_impl == "transformer_engine"
+            and self.config.pipeline_model_parallel_size > 1
+            and microbatch_idx >= len(self.cuda_graphs)
+        ):
+            raise RuntimeError(
+                "Packed microbatch count exceeds the captured source-batch bound; "
+                "recapture CUDA graphs before increasing the source batch size."
+            )
+        # PP1 captures one slot. Preserve modulo reuse for non-packed TE callers too;
+        # only scheduler-produced packed PP batches guarantee a fixed source-batch bound.
+        return microbatch_idx % len(self.cuda_graphs)
+
+    def _te_cuda_graph_backward_dw_graph(self, microbatch_idx):
+        """
+        CUDA Graph backward weight gradient computation for current layer.
+        """
+        cg_index = self._te_cuda_graph_index(microbatch_idx)
+        if not hasattr(self.cuda_graphs[cg_index], 'backward_dw'):
+            return
+        self.cuda_graphs[cg_index].backward_dw()
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
@@ -260,7 +365,8 @@ class GraphableMegatronModule(MegatronModule):
                 v, torch.Tensor
             ), "CUDA graph accepts only Tensor inputs."
 
-        cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
+        microbatch_idx = getattr(self, 'current_microbatch', 0)
+        cg_index = self._te_cuda_graph_index(microbatch_idx)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
 
         for hook, hook_args in self.cuda_graph_manual_hooks:
@@ -281,6 +387,18 @@ class GraphableMegatronModule(MegatronModule):
 
         cudagraph_kwargs = kwargs.copy()
         cudagraph_kwargs['is_first_microbatch'] = getattr(self, 'current_microbatch', 0) == 0
+        if self.config.fine_grained_activation_offloading and getattr(
+            self, 'offload_module_in_cuda_graph', False
+        ):
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
+
+            # TE captures/replays the module on its own graph stream. Passing the
+            # offload stream/event in lets TE order graph compute with D2H/H2D
+            # transfers managed by the fine-grained offload manager.
+            cudagraph_kwargs['cuda_graph_stream'] = off_interface.cuda_graph_stream()
+            cudagraph_kwargs['cuda_graph_event'] = off_interface.cuda_graph_event()
         return cudagraph_args, cudagraph_kwargs
 
     def _should_call_local_cudagraph(self, *args, **kwargs):
@@ -302,11 +420,7 @@ class GraphableMegatronModule(MegatronModule):
         )
 
     def __call__(self, *args, **kwargs):
-
         if self._should_call_local_cudagraph(*args, **kwargs):
-            # Set the is_first_microbatch flag for weight caching
-            current_microbatch = getattr(self, 'current_microbatch', 0)
-            self.cudagraph_manager.set_is_first_microbatch(current_microbatch == 0)
             return self.cudagraph_manager(self, args, kwargs)
         elif self._should_call_te_cudagraph(*args, **kwargs):
             if not self.cuda_graphs:
@@ -376,6 +490,40 @@ def float16_to_fp32(val):
     return conversion_helper(val, float_conversion)
 
 
+def mark_keep_in_fp32(tensor: torch.Tensor) -> torch.Tensor:
+    """Mark a parameter or buffer so that ``Float16Module`` keeps it in FP32.
+
+    Args:
+        tensor: The parameter or buffer to mark.
+
+    Returns:
+        The same tensor, for call-site convenience.
+    """
+    tensor.keep_in_fp32 = True
+    return tensor
+
+
+def convert_module_to_dtype_except_fp32_marked(
+    module: torch.nn.Module, dtype: torch.dtype
+) -> torch.nn.Module:
+    """Cast floating-point parameters and buffers except those marked to stay in FP32.
+
+    Args:
+        module: The module to convert in place.
+        dtype: The target floating-point dtype.
+
+    Returns:
+        The converted module.
+    """
+    return module._apply(
+        lambda tensor: (
+            tensor.to(dtype)
+            if tensor.is_floating_point() and not getattr(tensor, 'keep_in_fp32', False)
+            else tensor
+        )
+    )
+
+
 class Float16Module(MegatronModule):
     """Float 16 Module.
 
@@ -393,16 +541,22 @@ class Float16Module(MegatronModule):
         self.config = config
         self.fp16 = config.fp16
         self.bf16 = config.bf16
+        self.vp_size = config.virtual_pipeline_model_parallel_size
         self.vp_stage = getattr(module, 'vp_stage', None)
+        self.pg_collection = getattr(module, 'pg_collection', None)
 
         if self.fp16:
-            self.add_module('module', module.half())
+            self.add_module(
+                'module', convert_module_to_dtype_except_fp32_marked(module, torch.half)
+            )
 
             def float16_convertor(val):
                 return val.half()
 
         elif self.bf16:
-            self.add_module('module', module.bfloat16())
+            self.add_module(
+                'module', convert_module_to_dtype_except_fp32_marked(module, torch.bfloat16)
+            )
 
             def float16_convertor(val):
                 return val.bfloat16()
@@ -438,11 +592,23 @@ class Float16Module(MegatronModule):
             The wrapped module's outputs, potentially upcast to fp32 depending on pipeline stage
             and ``fp32_output``.
         """
-        if parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=self.vp_stage):
+        from megatron.core.pipeline_parallel.utils import (
+            is_pp_first_stage,
+            is_pp_last_stage,
+            is_vp_first_stage,
+            is_vp_last_stage,
+        )
+
+        if self.pg_collection is None:
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+        else:
+            pp_group = self.pg_collection.pp
+        if is_vp_first_stage(self.vp_stage, self.vp_size) and is_pp_first_stage(pp_group):
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
         if (
-            parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=self.vp_stage)
+            is_vp_last_stage(self.vp_stage, self.vp_size)
+            and is_pp_last_stage(pp_group)
             and fp32_output is True
         ):
             outputs = float16_to_fp32(outputs)

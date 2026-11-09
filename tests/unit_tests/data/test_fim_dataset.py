@@ -1,17 +1,18 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.core.datasets.utils import compile_helpers, get_blend_from_list
 from megatron.core.tokenizers import MegatronTokenizer
-from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.mark.parametrize("spm_rate", [0.0, 1.0])
 @pytest.mark.parametrize("split_sample", [None, "python"])
+@pytest.mark.usefixtures("ensure_test_data")
 def test_fim_gpt_dataset(spm_rate, split_sample):
     if torch.distributed.is_available():
         Utils.initialize_distributed()

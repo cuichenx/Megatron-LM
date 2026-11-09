@@ -14,6 +14,7 @@ from megatron.core.datasets.utils import Split
 
 from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
+from megatron.training.global_vars import get_run_config
 
 
 def build_pretraining_data_loader(dataset, consumed_samples):
@@ -21,6 +22,13 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     if dataset is None:
         return None
+    # Empty split (e.g. valid/test when --eval-iters 0): return null loader
+    try:
+        if len(dataset) == 0:
+            return None
+    except TypeError:
+        pass
+    cfg = get_run_config()
     args = get_args()
 
     if hasattr(dataset, 'split'):
@@ -30,47 +38,82 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     else:
         split = None
 
-    if split == Split.valid and args.full_validation:
-        batch_sampler = MegatronPretrainingSampler(
+    if args.dataloader_type == "external":
+        # External dataloaders are passed through. User is expected to provide a
+        # torch-compatible dataloader and define samplers, if needed.
+        return dataset
+
+    # Use eval-specific batch sizes for validation/test splits
+    is_eval = split in (Split.valid, Split.test)
+    micro_batch_size = cfg.validation.eval_micro_batch_size if is_eval else cfg.train.micro_batch_size
+
+    if split == Split.valid and cfg.validation.full_validation:
+        batch_sampler = MegatronFullValidationSampler(
             total_samples=len(dataset),
-            consumed_samples=0,
-            micro_batch_size=args.micro_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size(),
-        )
+            data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'single':
-        # Megatron sampler
+        # Packing schedulers consume one microbatch at a time and form
+        # global/DCP batches themselves.
         batch_sampler = MegatronPretrainingSampler(
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
-            micro_batch_size=args.micro_batch_size,
+            micro_batch_size=micro_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size(),
-        )
+            data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
-            micro_batch_size=args.micro_batch_size,
+            micro_batch_size=micro_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size(),
             data_sharding=args.data_sharding,
         )
-    elif args.dataloader_type == "external":
-        # External dataloaders are passed through. User is expected to provide a
-        # torch-compatible dataloader and define samplers, if needed.
-        return dataset
     else:
         raise Exception('{} dataloader type is not supported.'.format(args.dataloader_type))
 
     def worker_init_fn(_):
-        DistributedSignalHandler(args.exit_signal).__enter__()
+        import os
+
+        # Defensively close GPU device FDs in worker processes so workers do not
+        # keep references into NVIDIA memory space. This helps ensure GPU memory
+        # can be reclaimed even if a dataloader worker is delayed or fails to exit.
+        def close_nvidia_fds():
+            for fd in os.listdir("/proc/self/fd"):
+                try:
+                    path = os.readlink(f"/proc/self/fd/{fd}")
+                    if path.startswith("/dev/nvidia"):
+                        os.close(int(fd))
+                except OSError:
+                    pass
+
+        close_nvidia_fds()
+        if cfg.train.exit_signal_handler:
+            DistributedSignalHandler(cfg.train.exit_signal).__enter__()
 
     maybe_worker_init_fn = (
-        worker_init_fn if args.exit_signal_handler and args.num_workers > 0 else None
+        worker_init_fn if args.num_workers > 0 else None
     )
-    # Torch dataloader.
+    # Identity collate for VarlenDataset and packing-scheduler paths; they emit
+    # one variable-length dict per sample, not stack-able by the default
+    # collate. --varlen-sbhd-validation is excluded: it bypasses packing and
+    # emits fixed-length [seq_length] samples that the default collate stacks
+    # normally.
+    if (
+        (args.use_varlen_dataset and not args.varlen_sbhd_validation)
+        or cfg.model.transformer.dynamic_context_parallel
+        or cfg.model.transformer.sequence_packing_scheduler is not None
+    ):
+        extra_kwargs = {"collate_fn": lambda x: x}
+    else:
+        extra_kwargs = {}
+    # Own generator: otherwise _BaseDataLoaderIter draws _base_seed from the default CPU generator
+    # on ITERATOR creation, after load_checkpoint has restored it. initial_seed() reads the seed
+    # without consuming a draw.
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(torch.initial_seed())
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,
@@ -78,8 +121,9 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         pin_memory=True,
         persistent_workers=True if args.num_workers > 0 else False,
         worker_init_fn=maybe_worker_init_fn,
+        generator=loader_generator,
+        **extra_kwargs,
     )
-
 
 class MegatronPretrainingSampler:
     """
@@ -149,6 +193,48 @@ class MegatronPretrainingSampler:
         if len(batch) > 0 and not self.drop_last:
             start_idx, end_idx = self.get_start_end_idx()
             yield batch[start_idx:end_idx]
+
+class MegatronFullValidationSampler:
+    """Sampler for full validation that handles small datasets gracefully.
+
+    This sampler is designed for validation datasets that may be smaller than
+    data_parallel_size * micro_batch_size. It uses micro_batch_size=1 to minimize
+    the samples needed per batch and properly handles partial batches where some
+    ranks may not have data.
+    """
+
+    def __init__(self, total_samples, data_parallel_rank, data_parallel_size):
+        self.total_samples = total_samples
+        self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_size = data_parallel_size
+        self.micro_batch_size = 1  # Always use 1 for small dataset support
+
+        # Sanity checks
+        assert self.total_samples > 0, f'no sample to consume: {self.total_samples}'
+        assert data_parallel_size > 0
+        assert self.data_parallel_rank < data_parallel_size, \
+            f'data_parallel_rank should be smaller than data size: {self.data_parallel_rank}, {data_parallel_size}'
+
+    def __len__(self):
+        """Returns the number of batches this rank will yield."""
+        # Each batch takes data_parallel_size samples (1 per rank)
+        # This rank gets samples at indices: data_parallel_rank, data_parallel_rank + data_parallel_size, ...
+        num_batches = 0
+        for batch_idx in range(0, self.total_samples, self.data_parallel_size):
+            # Check if this rank has data in this batch
+            sample_idx = batch_idx + self.data_parallel_rank
+            if sample_idx < self.total_samples:
+                num_batches += 1
+        return num_batches
+
+    def __iter__(self):
+        """Yield batches for this data parallel rank."""
+        for batch_idx in range(0, self.total_samples, self.data_parallel_size):
+            # Check if this rank has data in this batch
+            sample_idx = batch_idx + self.data_parallel_rank
+            if sample_idx < self.total_samples:
+                # Yield a batch with a single sample index for this rank
+                yield [sample_idx]
 
 
 class RandomSeedDataset(Dataset):

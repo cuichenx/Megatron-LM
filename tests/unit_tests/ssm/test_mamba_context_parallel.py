@@ -1,7 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import math
-
 import pytest
 import torch
 import torch.nn as nn
@@ -24,6 +22,8 @@ class TestMambaContextParallel:
         ],
     )
     def test_forward(self, ngroups_local_tp, cp_size, D_has_hdim):
+        if Utils.world_size < cp_size:
+            pytest.skip(f"requires {cp_size} ranks, got {Utils.world_size}")
         Utils.initialize_model_parallel(context_parallel_size=cp_size)
 
         dtype = torch.bfloat16
@@ -62,7 +62,9 @@ class TestMambaContextParallel:
             nheads_local_tp=nheads_local_tp,
             ngroups_local_tp=ngroups_local_tp,
             d_state=d_state,
-            conv1d_cp1=conv1d_cp1,
+            conv1d_weight_cp1=conv1d_cp1.weight,
+            conv1d_bias_cp1=conv1d_cp1.bias,
+            conv1d_padding=conv1d_cp1.padding[0],
             dt_bias_cp1=dt_bias_cp1,
             A_log_cp1=A_log_cp1,
             D_cp1=D_cp1,
@@ -128,9 +130,9 @@ class TestMambaContextParallel:
     @pytest.mark.parametrize(
         "nheads_tp, ngroups_tp, cp_size, expected_error_message",
         [
-            (3, 2, 2, "nheads must be evenly divisible by tp_size \\* cp_size"),
-            (12, 3, 4, "cp_size must be evenly divisible by ngroups/tp_size"),
-            (12, 3, 2, "ngroups must be evenly divisible by tp_size \\* cp_size"),
+            (3, 2, 2, "TP-local head count 3 must be divisible by runtime CP size 2"),
+            (12, 3, 4, "runtime CP size 4 must be divisible by TP-local group count 3"),
+            (12, 3, 2, "TP-local group count 3 must be divisible by runtime CP size 2"),
         ],
     )
     def test_error_check(self, nheads_tp, ngroups_tp, cp_size, expected_error_message):
@@ -142,7 +144,9 @@ class TestMambaContextParallel:
                 nheads_local_tp=nheads_tp,
                 ngroups_local_tp=ngroups_tp,
                 d_state=None,
-                conv1d_cp1=None,
+                conv1d_weight_cp1=None,
+                conv1d_bias_cp1=None,
+                conv1d_padding=0,
                 dt_bias_cp1=None,
                 A_log_cp1=None,
                 D_cp1=None,
