@@ -124,7 +124,7 @@ def build_distributed_models(
     """Build a builder-backed config through its ``ModelBuilder``, keeping FP32-marked tensors exact.
 
     Megatron Core's builders apply ``mixed_precision_wrapper`` directly, so ``Float16Module`` rounds
-    router ``expert_bias`` values loaded before the wrap (Hugging Face or PEFT base weights) and casts
+    router ``expert_bias`` values loaded before the wrap (Hugging Face weights) and casts
     parameters listed in ``_keep_in_float32_parameter_names`` to the model dtype. The wrapper is
     applied through ``_apply_mixed_precision_wrapper`` instead, which restores both after the cast,
     as the provider path does.
@@ -769,7 +769,7 @@ def get_model(
         _finalize_model_quantization(model_module)
 
     # Set tensor model parallel attributes if not set
-    # In case pre_wrap_hook augmented the model (e.g. adding PEFT adapters)
+    # Refresh after pre_wrap_hook in case it augmented the model.
     for model_module in model:
         for param in model_module.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)

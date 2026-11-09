@@ -427,7 +427,7 @@ class MegatronQuantizationBridge:
             for local_name, _ in itertools.chain(
                 model.named_parameters(), persistent_buffers(model)
             ):
-                if "_extra_state" in local_name or self._is_adapter_param_name(local_name):
+                if "_extra_state" in local_name:
                     continue
                 local_name = self._unwrap_name(local_name)
                 global_name = _megatron_local_name_to_global(
@@ -760,14 +760,9 @@ class MegatronQuantizationBridge:
         cpu: bool = True,
         show_progress: bool = True,
         conversion_tasks: Optional[List["WeightConversionTask"]] = None,
-        merge_adapter_weights: bool = False,
     ) -> Iterable["HFWeightTuple"]:
         """Export Megatron weights to HuggingFace format with quantization."""
         from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
-
-        assert (
-            not merge_adapter_weights
-        ), "Adapter merging is not supported for quantized weights. Use merge_adapter_weights=False instead."
 
         if not isinstance(megatron_model, list):
             megatron_model = [megatron_model]
@@ -815,9 +810,6 @@ class MegatronQuantizationBridge:
 
             for hf_name, tensor in converted_weights_dict.items():
                 final_tensor = tensor.cpu() if cpu else tensor
-
-                if not merge_adapter_weights and "to_wrap.weight" in task.global_param_name:
-                    hf_name = hf_name[: -len("weight")] + "base_layer.weight"
 
                 if embeddings_are_tied and hf_name == "model.embed_tokens.weight":
                     yield HFWeightTuple(hf_name, final_tensor)

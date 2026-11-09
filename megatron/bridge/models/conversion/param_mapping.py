@@ -522,11 +522,6 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
             or ".experts.local_experts." in self.megatron_param
         )
 
-    @property
-    def is_adapter(self) -> bool:
-        """Check if this mapping is for an adapter parameter."""
-        return ".adapter." in self.megatron_param
-
     def _resolve_names(self, captures: Tuple[str, ...]) -> Tuple[str, Union[str, Dict[str, str]]]:
         """Resolve wildcard patterns with captured values.
 
@@ -1421,7 +1416,7 @@ class ColumnParallelMapping(MegatronParamMapping[torch.Tensor]):
             gathered = self.gather_from_tp_ranks(megatron_weights)
             full_weights = torch.cat(gathered, dim=0)
 
-        if self.is_expert and not self.is_adapter:
+        if self.is_expert:
             return self.gather_from_ep_ranks(full_weights, megatron_module, self.hf_param)
 
         return {str(self.hf_param): full_weights}
@@ -1460,7 +1455,7 @@ class ColumnParallelMapping(MegatronParamMapping[torch.Tensor]):
             gathered_s = self.gather_from_tp_ranks(scale)
             full_scale = torch.cat(gathered_s, dim=0)
 
-        if self.is_expert and not self.is_adapter:
+        if self.is_expert:
             q_weight_dict = self.gather_from_ep_ranks(full_q_weight, megatron_module, self.hf_param)
             s_dict = self.gather_from_ep_ranks_scale(full_scale, megatron_module, self.hf_param)
             for k, v in s_dict.items():
@@ -1620,7 +1615,7 @@ class RowParallelMapping(MegatronParamMapping[torch.Tensor]):
             gathered = self.gather_from_tp_ranks(megatron_weights)
             full_weights = torch.cat(gathered, dim=1)
 
-        if self.is_expert and not self.is_adapter:
+        if self.is_expert:
             return self.gather_from_ep_ranks(full_weights, megatron_module, self.hf_param)
 
         return {str(self.hf_param): full_weights}
@@ -1660,7 +1655,7 @@ class RowParallelMapping(MegatronParamMapping[torch.Tensor]):
             gathered_scale = self.gather_from_tp_ranks(scale)
             full_scale = torch.cat(gathered_scale, dim=1)
 
-        if self.is_expert and not self.is_adapter:
+        if self.is_expert:
             q_weight_dict = self.gather_from_ep_ranks(full_q_weight, megatron_module, self.hf_param)
             s_dict = self.gather_from_ep_ranks_scale(full_scale, megatron_module, self.hf_param)
             for k, v in s_dict.items():
@@ -3978,8 +3973,7 @@ def split_qkv_weights(
         provider (TransformerConfig): Model configuration provider.
         qkv (torch.Tensor): Interleaved QKV weights in Megatron format.
         feature_dim: Trailing tensor dimension used for reshape/split.
-            Defaults to ``provider.hidden_size`` for base weights, but LoRA
-            paths can pass the adapter rank explicitly.
+            Defaults to ``provider.hidden_size``.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Tuple of (Q, K, V)
@@ -4001,7 +3995,7 @@ def split_qkv_weights(
         hidden_size = 1
         qkv_reshaped = qkv.view(qkv_total_dim, head_size)
     elif feature_dim is not None:
-        # Explicit feature_dim (e.g. LoRA rank).
+        # Explicit trailing tensor dimension.
         hidden_size = feature_dim
         qkv_reshaped = qkv.view(qkv_total_dim, head_size, hidden_size)
     else:
@@ -4270,8 +4264,7 @@ def split_gdn_linear_weights(
         in_proj: Packed in-proj tensor.
         tp_size: Tensor-parallel world size used for packing layout.
         feature_dim: Trailing tensor dimension used for reshape/split.
-            Defaults to ``provider.hidden_size`` for base weights, but LoRA
-            paths can pass the adapter rank here.
+            Defaults to ``provider.hidden_size``.
     """
 
     assert tp_size >= 1, f"tp_size must be greater than 0, but got {tp_size=}"

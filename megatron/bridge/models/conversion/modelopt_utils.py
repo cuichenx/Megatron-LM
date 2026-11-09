@@ -301,10 +301,6 @@ def _mamba_row_indices(shards: list[_SourceState], tp_size: int) -> torch.Tensor
 
 
 def _validate_quantized_task(task: WeightConversionTask) -> None:
-    if ".to_wrap.weight" in task.global_param_name:
-        raise NotImplementedError(
-            "ModelOpt export requires adapters to be folded into base weights before quantization calibration"
-        )
     if isinstance(task.mapping, AutoMapping) and task.mapping.permute_dims is not None:
         raise NotImplementedError("ModelOpt export does not support dimension-permuting mappings")
 

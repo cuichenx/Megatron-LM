@@ -25,8 +25,8 @@ Only Super VL and Nemotron-H are registered. No other Omni variant, audio
 encoder, MIMO model, recipe library or Bridge training loop is imported. The
 shared expanded-sequence model still contains dormant optional audio handling;
 there is no supported audio construction path in this port. Shared conversion
-code retains its existing provider/PEFT utilities, but PEFT checkpoint I/O is
-explicitly unsupported here.
+code retains the provider utilities needed by model conversion. PEFT implementations,
+adapter conversion/merge APIs and their imports are excluded from this model-only port.
 
 This package intentionally occupies `megatron.bridge`. Run from this checkout
 with `PYTHONPATH=.`; do not combine this experiment with an independent Bridge

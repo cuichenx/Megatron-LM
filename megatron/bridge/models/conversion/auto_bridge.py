@@ -52,7 +52,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 if TYPE_CHECKING:
     from megatron.bridge.models.conversion.modelopt_utils import ModelOptExportPlan
     from megatron.bridge.models.conversion.param_mapping import LocalHFParam, LocalMXFP8Param
-    from megatron.bridge.peft.base import PEFT
 
 from safetensors.torch import save_file
 from transformers.configuration_utils import PretrainedConfig
@@ -925,7 +924,6 @@ class AutoBridge(Generic[MegatronModelT]):
         cpu: bool = False,
         show_progress: bool = True,
         conversion_tasks: Optional[List[WeightConversionTask]] = None,
-        merge_adapter_weights: bool = True,
         weight_dtype: Optional[torch.dtype] = None,
         with_megatron_names: bool = False,
         current_pp_stage_only: bool = False,
@@ -938,10 +936,6 @@ class AutoBridge(Generic[MegatronModelT]):
         streaming weight export or custom processing. By default all ranks get full tensors;
         set ``current_pp_stage_only=True`` to yield only the current pipeline stage's tensors.
 
-        If the model contains LoRA adapters, they will be automatically merged
-        into the base weights before export. This ensures the exported model
-        contains the full fine-tuned weights.
-
         Args:
             model: Megatron model instance or list of instances
             cpu: Whether to move tensors to CPU before yielding
@@ -951,8 +945,6 @@ class AutoBridge(Generic[MegatronModelT]):
                 *Please note that this is an advanced feature and should be used with caution.
                 The tasks needs to be built with the `get_conversion_tasks` method first and
                 carefully adjust based on your needs.*
-            merge_adapter_weights: Whether to gather and merge LoRA adapter weights into the base
-                tensors during export (defaults to True). Set to False to export only the base tensors.
             weight_dtype: Plain export dtype; skips quantized *.scale companions when set.
             with_megatron_names: Yield ``HFSourcedWeightTuple`` (param_name, weight,
                 megatron_param_names) instead of the two-field tuple, so each exported weight can
@@ -1000,7 +992,6 @@ class AutoBridge(Generic[MegatronModelT]):
             cpu=cpu,
             show_progress=show_progress,
             conversion_tasks=conversion_tasks,
-            merge_adapter_weights=merge_adapter_weights,
             weight_dtype=weight_dtype,
             # Only forward the flag when set so bridges with a custom streamer keep working by default.
             **({"with_megatron_names": True} if with_megatron_names else {}),
@@ -1052,7 +1043,6 @@ class AutoBridge(Generic[MegatronModelT]):
         cpu: bool = False,
         show_progress: bool = True,
         export_plan: Optional["ModelOptExportPlan"] = None,
-        merge_adapter_weights: bool = True,
     ) -> Iterable[tuple["HFWeightTuple", ...]]:
         """Export materialized ModelOpt weight groups.
 
@@ -1061,8 +1051,6 @@ class AutoBridge(Generic[MegatronModelT]):
             cpu: Move each exported tensor to CPU before yielding it.
             show_progress: Display conversion progress.
             export_plan: Reusable plan built by :meth:`build_hf_modelopt_export_plan`.
-            merge_adapter_weights: Must remain ``True``. Unmerged adapter export is
-                not supported by this API.
 
         Yields:
             One tuple per conversion task. Empty tuples preserve tasks that emit no
@@ -1077,11 +1065,8 @@ class AutoBridge(Generic[MegatronModelT]):
             group.
 
         Raises:
-            NotImplementedError: If unmerged adapters or custom Hugging Face export
-                overrides are requested.
+            NotImplementedError: If custom Hugging Face export overrides are requested.
         """
-        if not merge_adapter_weights:
-            raise NotImplementedError("ModelOpt export does not support unmerged adapter weights")
         if type(self).export_hf_weights is not AutoBridge.export_hf_weights:
             raise NotImplementedError(
                 "Grouped ModelOpt export does not support AutoBridge subclasses "
@@ -1107,7 +1092,6 @@ class AutoBridge(Generic[MegatronModelT]):
             cpu=cpu,
             show_progress=show_progress,
             conversion_tasks=prepare_modelopt_export_tasks(export_plan),
-            merge_adapter_weights=merge_adapter_weights,
         )
 
     def export_hf_weights_modelopt(
@@ -1117,11 +1101,8 @@ class AutoBridge(Generic[MegatronModelT]):
         cpu: bool = False,
         show_progress: bool = True,
         export_plan: Optional["ModelOptExportPlan"] = None,
-        merge_adapter_weights: bool = True,
     ) -> Iterable["HFWeightTuple"]:
         """Export canonical ModelOpt deployment tensors from a prepared plan."""
-        if not merge_adapter_weights:
-            raise NotImplementedError("ModelOpt export does not support unmerged adapter weights")
         if not isinstance(model, list):
             model = [model]
         if export_plan is None:
@@ -1133,7 +1114,6 @@ class AutoBridge(Generic[MegatronModelT]):
             cpu=cpu,
             show_progress=show_progress,
             conversion_tasks=prepare_modelopt_export_tasks(export_plan),
-            merge_adapter_weights=merge_adapter_weights,
         )
 
     def export_hf_weights_quant(
@@ -1145,7 +1125,6 @@ class AutoBridge(Generic[MegatronModelT]):
         cpu: bool = False,
         show_progress: bool = True,
         conversion_tasks: Optional[List[WeightConversionTask]] = None,
-        merge_adapter_weights: bool = False,
     ) -> Iterable["HFWeightTuple"]:
         """
         Export Megatron model weights to HuggingFace format with quantization.
@@ -1161,233 +1140,7 @@ class AutoBridge(Generic[MegatronModelT]):
             cpu=cpu,
             show_progress=show_progress,
             conversion_tasks=conversion_tasks,
-            merge_adapter_weights=merge_adapter_weights,
         )
-
-    def export_adapter_weights(
-        self,
-        model: list[MegatronModelT],
-        cpu: bool = True,
-        show_progress: bool = True,
-        exclude_adapter_base_prefixes: Iterable[str] | None = None,
-        expand_shared_outer: bool = False,
-        stack_3d_moe: bool = False,
-        with_megatron_names: bool = False,
-    ) -> Iterable["HFWeightTuple"]:
-        """
-        Export only adapter weights from a Megatron model without merging them into base tensors.
-
-        This is useful when you want to save or inspect LoRA adapters independently from the
-        underlying pretrained weights.
-
-        Args:
-            model: Megatron model instance or list of instances
-            cpu: Whether to move tensors to CPU before yielding
-            show_progress: Display progress bar during export
-            exclude_adapter_base_prefixes: Megatron adapter base prefixes to
-                skip before resolving HuggingFace parameter mappings.
-            expand_shared_outer: Replicate the shared factor across experts under per-expert
-                names (vLLM 2D ``pack_moe``) instead of a shared ``[1, ...]`` tensor (SGLang).
-                Default ``False``; no effect for non-shared-outer adapters.
-            stack_3d_moe: Emit shared-outer routed-expert LoRA as the two stacked 3D
-                tensors vLLM's 3D-MoE consumer (``FusedMoE3DWithLoRA``) looks up
-                (``...experts.base_layer`` for gate_up_proj, bare ``...experts`` for
-                down_proj), instead of the per-expert 2D ``pack_moe`` layout.
-                Default ``False``; no effect for non-shared-outer adapters.
-            with_megatron_names: Yield ``HFSourcedWeightTuple`` whose ``megatron_param_names``
-                holds the adapter's ``linear_in`` (lora_A) or ``linear_out`` (lora_B) Megatron
-                weight name. Default ``False`` keeps the two-field tuple.
-
-        Yields:
-            HFWeightTuple: Named tuples of (param_name, weight_tensor) for adapter parameters,
-            or HFSourcedWeightTuple when ``with_megatron_names`` is set
-
-        Note:
-            With ``expand_shared_outer``, the per-expert copies of the shared factor alias one
-            storage rather than being cloned. ``safetensors.torch.save_file`` rejects tensors
-            that share memory, so callers serializing these tensors directly must clone them
-            first — :meth:`save_hf_adapter` already does.
-        """
-        bridge = self._model_bridge
-        if with_megatron_names:
-            _check_with_megatron_names_support(bridge.stream_adapter_weights_megatron_to_hf, bridge)
-        return bridge.stream_adapter_weights_megatron_to_hf(
-            model,
-            cpu=cpu,
-            show_progress=show_progress,
-            exclude_adapter_base_prefixes=exclude_adapter_base_prefixes,
-            expand_shared_outer=expand_shared_outer,
-            stack_3d_moe=stack_3d_moe,
-            **({"with_megatron_names": True} if with_megatron_names else {}),
-        )
-
-    def save_hf_adapter(
-        self,
-        model: list[MegatronModelT],
-        path: str | Path,
-        peft_config: "PEFT",
-        base_model_name_or_path: Optional[str] = None,
-        show_progress: bool = True,
-        exclude_adapter_base_prefixes: Iterable[str] | None = None,
-        expand_shared_outer: bool = False,
-        allow_serving_layout: bool = False,
-    ) -> None:
-        """Save LoRA adapter weights as a HuggingFace PEFT-compatible directory.
-
-        The output directory contains ``adapter_config.json`` and
-        ``adapter_model.safetensors`` and can be loaded directly with
-        ``peft.PeftModel.from_pretrained(base_model, path)`` -- except when
-        ``allow_serving_layout`` is used, which writes a serving-only layout.
-
-        Args:
-            model: Megatron model instance or list of instances.
-            path: Directory path where the adapter files will be saved.
-            peft_config: The LoRA / DoRA config used during training (provides
-                ``dim``, ``alpha``, ``dropout``, etc.).
-            base_model_name_or_path: HuggingFace model identifier or local path
-                of the base model this adapter was trained on.  If *None*, the
-                value is inferred from ``hf_pretrained.model_name_or_path``.
-            show_progress: Display progress bar during export.
-            exclude_adapter_base_prefixes: Megatron adapter base prefixes to
-                skip before resolving HuggingFace parameter mappings.
-            expand_shared_outer: Replicate the shared factor of a shared-outer MoE LoRA across
-                experts under per-expert names (vLLM 2D ``pack_moe``); this is the PEFT-loadable
-                form of such an adapter. Default ``False`` keeps the shared ``[1, ...]`` factor as
-                exported, which then requires ``allow_serving_layout``.
-            allow_serving_layout: Write shared-outer MoE LoRA pairs in the serving layout (the
-                shared factor once as ``[1, ...]`` under the expert-agnostic name, next to its
-                per-expert partner) instead of raising. Serving stacks keyed on the leading
-                expert dim (SGLang ``experts_shared_outer_loras``) read this layout; it is not
-                loadable by ``PeftModel.from_pretrained``. Default ``False``.
-
-        Example:
-            >>> bridge.save_hf_adapter(
-            ...     megatron_model,
-            ...     "./my-lora-adapter",
-            ...     peft_config=lora,
-            ...     base_model_name_or_path="Qwen/Qwen3-4B",
-            ... )
-            >>> # Load with HuggingFace PEFT
-            >>> from peft import PeftModel
-            >>> from transformers import AutoModelForCausalLM
-            >>> base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-4B")
-            >>> model = PeftModel.from_pretrained(base, "./my-lora-adapter")
-
-        Note:
-            This method is collective -- all ranks must call it.  Only rank 0
-            writes files to disk; the other ranks participate in the generator
-            to gather distributed (TP/PP/EP) tensors.
-
-            For language-only adapters extracted from a VL model, construct the
-            bridge from the standalone HF text base before exporting. During
-            training, set ``checkpoint.hf_source_path`` to that text base.
-        """
-        if getattr(self, "text_only", False) is True:
-            raise ValueError(
-                "Adapter export from a projected VL source requires a standalone HF text base. "
-                "Set checkpoint.hf_source_path to that base, or construct AutoBridge from it before exporting."
-            )
-
-        import json
-
-        from safetensors.torch import save_file
-
-        from megatron.bridge.models.conversion.peft_bridge import (
-            build_adapter_config_dict,
-            convert_adapter_weights_to_peft_state,
-            infer_rank_pattern_from_adapter_weights,
-        )
-
-        if dist.is_initialized():
-            dist.barrier()
-
-        is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
-
-        # Every rank drives the export generator, because gathering the sharded
-        # adapter tensors is collective; only rank 0 writes the adapter, so only
-        # rank 0 keeps the gathered weights. Keeping them on every rank made the
-        # host memory of an export scale with the number of ranks per node
-        # (one full copy of the adapter per rank), which exhausts host memory for
-        # large per-expert MoE adapters.
-        raw_adapter_weights: list[HFWeightTuple] = []
-        exported_count = 0
-        for exported_weight in self.export_adapter_weights(
-            model,
-            cpu=True,
-            show_progress=show_progress,
-            exclude_adapter_base_prefixes=exclude_adapter_base_prefixes,
-            expand_shared_outer=expand_shared_outer,
-        ):
-            exported_count += 1
-            if is_rank0:
-                raw_adapter_weights.append(
-                    HFWeightTuple(
-                        exported_weight.param_name, exported_weight.weight.detach().clone()
-                    )
-                )
-            del exported_weight
-        if exported_count == 0:
-            raise RuntimeError(
-                "No adapter weights were found on the model. "
-                "Ensure the model has PEFT adapters applied before calling save_hf_adapter()."
-            )
-
-        # Rank 0 converts and writes alone, so a failure there has to reach every
-        # rank: the others would otherwise wait forever at the final collective.
-        # As in prepare_hf_dataset_sources, rank 0 broadcasts a status string,
-        # re-raises its own exception, and the other ranks raise a RuntimeError
-        # that names it.
-        write_error: Exception | None = None
-        if is_rank0:
-            try:
-                adapter_state, module_adapter_keys, target_parameters = (
-                    convert_adapter_weights_to_peft_state(
-                        raw_adapter_weights, allow_serving_layout=allow_serving_layout
-                    )
-                )
-                rank_pattern = infer_rank_pattern_from_adapter_weights(
-                    raw_adapter_weights, default_rank=getattr(peft_config, "dim", 32)
-                )
-                del raw_adapter_weights
-
-                save_dir = Path(path)
-                save_dir.mkdir(parents=True, exist_ok=True)
-
-                if base_model_name_or_path is None:
-                    base_model_name_or_path = str(
-                        getattr(self.hf_pretrained, "model_name_or_path", "")
-                        or getattr(self.hf_pretrained, "name_or_path", "")
-                    )
-
-                target_modules = self._model_bridge._adapter_target_modules(module_adapter_keys)
-                adapter_config = build_adapter_config_dict(
-                    peft_config,
-                    target_modules=target_modules,
-                    target_parameters=target_parameters,
-                    base_model_name_or_path=base_model_name_or_path,
-                    rank_pattern=rank_pattern,
-                )
-
-                config_path = save_dir / "adapter_config.json"
-                with open(config_path, "w") as f:
-                    json.dump(adapter_config, f, indent=2)
-
-                weights_path = save_dir / "adapter_model.safetensors"
-                save_file(adapter_state, str(weights_path))
-            except Exception as error:
-                write_error = error
-
-        if dist.is_initialized():
-            status = [
-                None if write_error is None else f"{type(write_error).__name__}: {write_error}"
-            ]
-            dist.broadcast_object_list(status, src=0)
-            if status[0] is not None:
-                if write_error is not None:
-                    raise write_error
-                raise RuntimeError(f"Rank zero failed to write the HF adapter: {status[0]}")
-        elif write_error is not None:
-            raise write_error
 
     def save_hf_pretrained(
         self,
@@ -1396,7 +1149,6 @@ class AutoBridge(Generic[MegatronModelT]):
         show_progress: bool = True,
         source_path: Optional[Union[str, Path]] = None,
         strict: bool = True,
-        merge_adapter_weights: bool = True,
         distributed_save: bool = False,
         save_every_n_ranks: int = 1,
         weight_dtype: Optional[torch.dtype] = None,
@@ -1407,10 +1159,6 @@ class AutoBridge(Generic[MegatronModelT]):
         This method exports the complete model including configuration, tokenizer,
         and weights to a directory that can be loaded with HuggingFace's
         from_pretrained methods.
-
-        If the model contains LoRA adapters, they will be automatically merged
-        into the base weights before saving. This ensures the saved model
-        contains the full fine-tuned weights.
 
         If the original model was loaded with trust_remote_code=True, any custom
         modeling files (e.g., modeling_*.py, configuration_*.py) will be preserved
@@ -1428,7 +1176,6 @@ class AutoBridge(Generic[MegatronModelT]):
                 HuggingFace model with custom modeling files needs to be referenced. If not specified,
                 the path will be automatically determined from the HuggingFace configuration.
             strict: Whether to perform strict validation during weight export
-            merge_adapter_weights: Whether to gather/merge LoRA adapter weights into base tensors during export.
             distributed_save: Whether to enable distributed saving mode where each rank saves
                 part of weights independently. When False (default), only rank 0 performs
                 the save operation after gathering weights from all ranks.
@@ -1458,7 +1205,6 @@ class AutoBridge(Generic[MegatronModelT]):
             path,
             show_progress,
             strict,
-            merge_adapter_weights=merge_adapter_weights,
             distributed_save=distributed_save,
             save_every_n_ranks=save_every_n_ranks,
             weight_dtype=weight_dtype,
@@ -1686,7 +1432,6 @@ class AutoBridge(Generic[MegatronModelT]):
         path: str | Path,
         show_progress: bool = True,
         strict: bool = True,
-        merge_adapter_weights: bool = True,
         distributed_save: bool = False,
         save_every_n_ranks: int = 1,
         weight_dtype: Optional[torch.dtype] = None,
@@ -1699,10 +1444,6 @@ class AutoBridge(Generic[MegatronModelT]):
         to handle large models efficiently without requiring all weights in memory
         at once.
 
-        If the model contains LoRA adapters, they will be automatically merged
-        into the base weights before saving. This ensures the saved weights
-        contain the full fine-tuned parameters.
-
         The weights are gathered from distributed ranks and saved in the standard
         HuggingFace sharded format when the model is large.
 
@@ -1710,7 +1451,6 @@ class AutoBridge(Generic[MegatronModelT]):
             model: Megatron model instance or list of instances
             path: Directory path where weight files will be saved
             show_progress: Display progress bar during export
-            merge_adapter_weights: Whether to gather/merge LoRA adapter weights into base tensors during export.
             distributed_save: Whether to enable distributed saving mode where each rank saves
                 part of weights independently.
             save_every_n_ranks: Interval for saving weights across ranks in distributed mode.
@@ -1746,7 +1486,6 @@ class AutoBridge(Generic[MegatronModelT]):
             self.hf_pretrained,
             cpu=True,
             show_progress=show_progress,
-            merge_adapter_weights=merge_adapter_weights,
             weight_dtype=weight_dtype,
         )
         model_instance = self._get_model_instance(model)
@@ -2139,53 +1878,6 @@ class AutoBridge(Generic[MegatronModelT]):
                 source_path=source_path,
                 strict=strict,
             )
-
-    def export_adapter_ckpt(
-        self,
-        peft_checkpoint: str | Path,
-        output_path: str | Path,
-        show_progress: bool = True,
-        exclude_adapter_base_prefixes: Iterable[str] | None = None,
-        expand_shared_outer: bool = False,
-    ) -> None:
-        """Export LoRA adapter weights from a Megatron PEFT checkpoint to HuggingFace PEFT format.
-
-        This convenience method loads a Megatron-Bridge fine-tuning checkpoint,
-        reconstructs the LoRA adapter structure from ``run_config.yaml``, and
-        writes a HuggingFace PEFT-compatible directory containing
-        ``adapter_config.json`` and ``adapter_model.safetensors``.
-
-        The bridge must be created with ``from_hf_pretrained`` so that
-        base weights are available for the conversion mapping.
-
-        Args:
-            peft_checkpoint: Path to the Megatron-Bridge distributed checkpoint
-                that contains LoRA adapter weights (produced by a PEFT
-                fine-tuning run).  May point at the top-level run directory
-                (containing ``iter_*`` folders) or directly at an iteration
-                directory.
-            output_path: Directory where the adapter files will be saved.
-            show_progress: Display progress bar during export.
-            exclude_adapter_base_prefixes: Megatron adapter base prefixes to
-                skip before resolving HuggingFace parameter mappings.
-            expand_shared_outer: Replicate the shared factor across experts under per-expert
-                names (vLLM 2D ``pack_moe``). Default ``False`` keeps the PEFT shared ``[1, ...]``
-                layout. Enabling it multiplies the shared factor's on-disk size by the expert
-                count; no effect for non-shared-outer adapters.
-
-        Example:
-            >>> bridge = AutoBridge.from_hf_pretrained("meta-llama/Llama-3.2-1B")
-            >>> bridge.export_adapter_ckpt(
-            ...     "/path/to/finetune_ckpt",
-            ...     "./my_adapter",
-            ... )
-            >>> # Load with HuggingFace PEFT
-            >>> from peft import PeftModel
-            >>> from transformers import AutoModelForCausalLM
-            >>> base = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
-            >>> model = PeftModel.from_pretrained(base, "./my_adapter")
-        """
-        raise NotImplementedError("PEFT checkpoint I/O is outside the Super VL port scope")
 
     def push_to_hub(self, path: str | Path) -> None: ...
 
