@@ -7,15 +7,17 @@ MLM checkout with ``python -m torch.distributed.run --nproc-per-node=1``.
 
 import argparse
 import inspect
+import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
-from transformers import PretrainedConfig
+from transformers import AutoConfig, NemotronHConfig, PretrainedConfig, PreTrainedTokenizerFast
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
@@ -61,6 +63,16 @@ def main() -> None:
     parser.add_argument(
         "--vision", action="store_true", help="Also construct the full RADIO encoder"
     )
+    parser.add_argument(
+        "--hf-fixture-output",
+        type=Path,
+        help="Save the reduced random text checkpoint for CLI comparison",
+    )
+    parser.add_argument(
+        "--vl-reference-config",
+        type=Path,
+        help="Local trusted Super VL config/code artifacts for a reduced-language VL fixture",
+    )
     options = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     assert Path(inspect.getfile(AutoBridge)).is_relative_to(root / "megatron/bridge")
@@ -76,6 +88,13 @@ def main() -> None:
         projector_hidden_size=256,
         video_temporal_patch_size=1,
     )
+    if options.vl_reference_config is not None:
+        vl = AutoConfig.from_pretrained(options.vl_reference_config, trust_remote_code=True)
+        vl.llm_config = NemotronHConfig(**text.to_dict())
+        vl.img_context_token_id = 18
+        vl.projector_hidden_size = 256
+        # This is a random fixture, not an export of the metadata-only source.
+        vl.name_or_path = ""
     vl_bridge = AutoBridge.from_hf_config(vl)
     assert isinstance(vl_bridge._model_bridge, Nemotron35SuperVLBridge)
     vl_config = vl_bridge.get_model_config()
@@ -124,6 +143,29 @@ def main() -> None:
         with TemporaryDirectory(prefix="mlm-super-vl-hf-") as directory:
             exported = dict(bridge.export_hf_weights(models, cpu=True, show_progress=False))
             assert exported
+            if options.hf_fixture_output is not None:
+                from tokenizers import Tokenizer
+                from tokenizers.models import WordLevel
+
+                options.hf_fixture_output.mkdir(parents=True, exist_ok=False)
+                fixture_config = NemotronHConfig(**text.to_dict())
+                fixture_config.architectures = ["NemotronHForCausalLM"]
+                fixture_config.save_pretrained(options.hf_fixture_output)
+                tokenizer = PreTrainedTokenizerFast(
+                    tokenizer_object=Tokenizer(
+                        WordLevel({f"token{i}": i for i in range(256)}, unk_token="token0")
+                    ),
+                    unk_token="token0",
+                    bos_token="token1",
+                    eos_token="token2",
+                    pad_token="token3",
+                )
+                tokenizer.save_pretrained(options.hf_fixture_output)
+                save_file(
+                    {name: value.contiguous() for name, value in exported.items()},
+                    str(options.hf_fixture_output / "model.safetensors"),
+                )
+                logger.warning("Saved reduced random HF fixture: %s", options.hf_fixture_output)
             # Exercise the actual Super VL namespace projection from a local
             # safetensors checkpoint, including exclusion of a media-only weight.
             tensors = {
@@ -162,11 +204,44 @@ def main() -> None:
                     None,
                     images=torch.randn(1, 3, 32, 32, device="cuda", dtype=torch.bfloat16),
                     imgs_sizes=torch.tensor([[32, 32]], device="cuda"),
+                    num_frames=[1],
                 )
             assert torch.isfinite(output).all()
             logger.warning(
                 "Super VL RADIO + projector + tiny language forward PASS: %s", tuple(output.shape)
             )
+            if options.hf_fixture_output is not None and options.vl_reference_config is not None:
+                vl_output = options.hf_fixture_output.with_name(
+                    options.hf_fixture_output.name + "-vl"
+                )
+                vl_output.mkdir(parents=True, exist_ok=False)
+                for artifact in options.vl_reference_config.glob("*.py"):
+                    shutil.copy2(artifact, vl_output / artifact.name)
+                vl.save_pretrained(vl_output)
+                tokenizer.save_pretrained(vl_output)
+                vl_weights = dict(
+                    vl_bridge.export_hf_weights(vl_models, cpu=True, show_progress=False)
+                )
+                save_file(
+                    {name: value.contiguous() for name, value in vl_weights.items()},
+                    str(vl_output / "model.safetensors"),
+                )
+                # Match the indexed public checkpoint layout: Super VL export
+                # adds its deterministic RADIO buffer through this index.
+                (vl_output / "model.safetensors.index.json").write_text(
+                    json.dumps(
+                        {
+                            "metadata": {
+                                "total_size": sum(
+                                    value.numel() * value.element_size()
+                                    for value in vl_weights.values()
+                                )
+                            },
+                            "weight_map": {name: "model.safetensors" for name in vl_weights},
+                        }
+                    )
+                )
+                logger.warning("Saved reduced-language VL HF fixture: %s", vl_output)
     finally:
         parallel_state.destroy_model_parallel()
         dist.destroy_process_group()

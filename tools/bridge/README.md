@@ -53,8 +53,15 @@ or validation of the unified `pretrain()` lifecycle.
 
 ## Conversion entrypoint
 
-`convert_checkpoint.py` uses the ported AutoBridge mappings and MCore
-distributed checkpoint I/O. The native output stores `model`/`modelN` weights,
+Use Bridge's existing `scripts/conversion/convert.sh` and
+`scripts/conversion/run_conversion.py`, copied from
+[`08035723`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/08035723e7a86f94fc54a7f4473bd0519f2ac941/scripts/conversion).
+The launcher changes only repository-root/import paths. Its conversion workers
+are retained; this branch supplies their model/conversion dependencies inside MLM.
+The older `tools/bridge/convert_checkpoint.py` is retained only as a historical
+prototype, not the entrypoint used for the comparison below.
+
+The native output stores `model`/`modelN` weights,
 checkpoint version/iteration and MLM's `run_config.yaml`, publishing the tracker
 only after successful save. It does not install global training args.
 
@@ -62,26 +69,26 @@ For an already accessible HF checkpoint, using an appropriately sized GPU job:
 
 ```bash
 PYTHONPATH=. uv run --no-project python -m torch.distributed.run \
-  --nproc-per-node=8 tools/bridge/convert_checkpoint.py import \
+  --nproc-per-node=8 scripts/conversion/run_conversion.py import --device gpu \
   --hf-model /models/super-vl --megatron-path /checkpoints/super-vl \
-  --tensor-model-parallel-size 8
+  --tp 2 --ep 8 --etp 1 --trust-remote-code
 
 # Same source, but import only its language weights:
 PYTHONPATH=. uv run --no-project python -m torch.distributed.run \
-  --nproc-per-node=8 tools/bridge/convert_checkpoint.py import \
+  --nproc-per-node=8 scripts/conversion/run_conversion.py import --device gpu \
   --hf-model /models/super-vl --megatron-path /checkpoints/super-text \
-  --tensor-model-parallel-size 8 --text-only
+  --tp 2 --ep 8 --etp 1 --trust-remote-code --text-only
 
 PYTHONPATH=. uv run --no-project python -m torch.distributed.run \
-  --nproc-per-node=8 tools/bridge/convert_checkpoint.py export \
+  --nproc-per-node=8 scripts/conversion/run_conversion.py export --device gpu \
   --hf-model /models/super-vl --megatron-path /checkpoints/super-text \
-  --hf-output /exports/super-text --tensor-model-parallel-size 8 --text-only
+  --hf-path /exports/super-text --tp 2 --ep 8 --etp 1 --trust-remote-code --text-only
 ```
 
 GPU counts above are illustrative, not a measured capacity recommendation.
 The public source is `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`.
-Use a pinned `--revision` for a Hub source. `--trust-remote-code` and
-`--save-tokenizer` are explicit opt-ins. Native HF Super VL configs require
+Use a pinned `--hf-revision` for a Hub source. `--trust-remote-code` is
+an explicit opt-in. Native HF Super VL configs require
 Transformers >=5.18; older environments need the original remote-code config.
 
 Initial scope is builder-backed `torch_dist` weights only. Legacy args/provider
@@ -90,6 +97,39 @@ checkpoint I/O and destructive low-memory saves are not supported. Loading
 preserves saved topology unless explicit overrides are supplied. Full-scale
 pretrained conversion, multi-rank conversion and training-loop integration
 remain validation work, not claims made by the reduced probe.
+
+## Existing-script comparison (2026-11-08)
+
+Reference: Bridge `08035723e7a86f94fc54a7f4473bd0519f2ac941`. Candidate:
+this MLM-only tree. Both use the same MLM Core and cached NeMo 26.08.rc9
+environment, with separate Python import paths and checkpoint directories.
+No Bridge training package is imported by the candidate.
+
+- Reduced Nemotron-H with Mamba, attention, MoE and MTP: existing GPU import and
+  export scripts pass on both sides. All 52 tensors match the original fixture
+  exactly, including dtype; exported config and tokenizer match between arms.
+- Super VL with the public model's full RADIO configuration and a tiny Hybrid
+  language model: both imports/exports pass. All 446 exported tensors match
+  exactly between arms. This includes all 445 source tensors plus the same
+  deterministic RADIO summary-index buffer added by the existing exporter.
+  Exported config and tokenizer also match between arms.
+- Text-only conversion from that same VL fixture: both scripts pass, with all
+  52 language tensors matching the source projection exactly, and matching
+  exported config/tokenizer.
+- `convert.sh` local GPU import passes. An offline container without a resolvable
+  hostname needs `PET_LOCAL_ADDR=127.0.0.1` for the existing torchrun rendezvous.
+- The comparison exposed one prototype loader bug: reverse HF translation needs
+  model-specific `from_dict()` to restore activation callables, not generic
+  instantiation alone. The loader now follows Bridge's reconstruction path while
+  preserving recursive target allowlist checks.
+
+The reference uses Bridge checkpoint metadata and the candidate uses MLM
+`run_config.yaml`; checkpoint directories are not expected to be byte-identical.
+The equivalence gate is exported tensor keys, shapes, dtypes and values, plus
+exported model config and tokenizer. These are reduced-model conversion results,
+not pretrained full-size forward parity. Distributed CPU, PP repartitioning and
+full-size conversion remain unverified. The full-size source is pinned to
+`fb0ee0bc6b3f70342afd8d84cb80dbadbaa8a1fe`.
 
 ## Cross-PR integration adjustments
 

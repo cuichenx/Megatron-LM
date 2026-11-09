@@ -68,13 +68,31 @@ def resolve_checkpoint_path(path: str | Path) -> Path:
 
 def load_model_config(path: str | Path) -> tuple[ModelConfig, None]:
     """Read native builder metadata; legacy args/provider reconstruction is not ported."""
-    from megatron.training.config.instantiate_utils import instantiate
+    from megatron.training.config.instantiate_utils import _resolve_target
 
     checkpoint = resolve_checkpoint_path(path)
     metadata = read_run_config(get_checkpoint_run_config_filename(str(checkpoint)))
-    config = instantiate(metadata["model"])
-    if not isinstance(config, ModelConfig):
+    model_dict = metadata["model"]
+
+    def check_targets(value: Any, key: str) -> None:
+        # from_dict reconstructs nested dataclasses directly. Preserve the same
+        # target allowlist as instantiate before allowing those imports.
+        if isinstance(value, dict):
+            if "_target_" in value:
+                _resolve_target(value["_target_"], full_key=f"{key}._target_", check_callable=False)
+            for name, item in value.items():
+                check_targets(item, f"{key}.{name}")
+        elif isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                check_targets(item, f"{key}.{index}")
+
+    check_targets(model_dict, "model")
+    model_config_cls = _resolve_target(model_dict["_target_"], full_key="model._target_")
+    if not isinstance(model_config_cls, type) or not issubclass(model_config_cls, ModelConfig):
         raise TypeError("This conversion port requires a builder-backed model config")
+    # Match Bridge's loader: model-specific from_dict restores activation callables
+    # and other serialized fields before reverse HF config translation consumes them.
+    config = model_config_cls.from_dict(model_dict)
     return config, None
 
 
