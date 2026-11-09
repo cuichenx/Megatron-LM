@@ -116,6 +116,8 @@ No Bridge training package is imported by the candidate.
 - Text-only conversion from that same VL fixture: both scripts pass, with all
   52 language tensors matching the source projection exactly, and matching
   exported config/tokenizer.
+- Repeating that text-only import/export on two GPUs with TP=2, EP=2, ETP=1
+  also passes on both sides: all 52 tensors, config and tokenizer match exactly.
 - `convert.sh` local GPU import passes. An offline container without a resolvable
   hostname needs `PET_LOCAL_ADDR=127.0.0.1` for the existing torchrun rendezvous.
 - The comparison exposed one prototype loader bug: reverse HF translation needs
