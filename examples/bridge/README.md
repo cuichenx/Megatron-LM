@@ -1,0 +1,236 @@
+# [DO NOT MERGE] Training-loop / model conversion experiment
+
+This fork branch combines the following **pinned** changes. It is not a proposal
+to merge these PRs as one patch, and does not change their original branches.
+
+| Input | Pinned revision |
+| --- | --- |
+| MLM main | `7f510b60c04bdda411019f581f20bda78cc250a6` |
+| #8205 — DDP/FSDP | `73cd9648c5850cb89b172c84bfce1765cf054f7c` |
+| #8234 — model config | `872898a72482a37770dded87366823e7e2f49c41` |
+| #8978 — dataset inputs | `436688a90eac46fbb0ad467cd1e31c2697f92e2e` |
+| #8851 — fault tolerance | `b77007d5f92feed6d429be20f4cdb1b4bb8b63f0` |
+| #8340 — ModelOpt builders | `8a9e22443ff30b5be187d3a40ee4719f68576aa5` |
+| #8444 — VLM inputs | `b3d041b74c9b8047ea1890a2a2a1a5d4f5eef48e` |
+
+## Model conversion port
+
+`megatron/bridge` contains the native `Nemotron35SuperVLBridge`, its Nemotron-H
+text-only projection, model builders, AutoBridge and the shared conversion
+dependency closure. The source is Apache-2.0 Megatron Bridge at
+[`53c20f81`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/53c20f81cb575f19af34ff0ae1749fb13b07999b).
+Copied files carry source links and notices.
+
+The Qwen 3.5/3.8 dense and MoE text/VL bridges and their model components are
+ported from latest Bridge
+[`0f0620592`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/commit/0f06205924d4e19b0723aa8c33e34a1959ca17fe),
+including its Qwen 3.5 Hybrid migration. Qwen VL uses the native Hybrid language
+decoder plus the shared Qwen vision encoder. Deprecated provider and
+token-classification paths are not included.
+
+Super VL, Nemotron-H, and these Qwen bridges are registered. No other Omni variant, audio
+encoder, MIMO model, recipe library or Bridge training loop is imported. The
+shared expanded-sequence model still contains dormant optional audio handling;
+there is no supported audio construction path in this port. Shared conversion
+code retains the provider utilities needed by model conversion. PEFT implementations,
+adapter conversion/merge APIs and their imports are excluded from this model-only port.
+
+This package intentionally occupies `megatron.bridge`. Run from this checkout
+with `PYTHONPATH=.`; do not combine this experiment with an independent Bridge
+installation and assume both packages are active.
+
+## Offline probe
+
+Conversion entrypoints live in `examples/bridge/conversion`, with shared launcher
+helpers in `examples/bridge/common`. The reduced forward/backward probe lives in
+`examples/bridge/training`; it is not a full training entrypoint.
+
+Inside a compatible GPU development environment:
+
+```bash
+PYTHONPATH=. uv run --no-project python -m torch.distributed.run \
+  --nproc-per-node=1 examples/bridge/training/smoke_super_vl.py
+
+# Additionally build the full RADIO encoder with a tiny language model:
+PYTHONPATH=. uv run --no-project python -m torch.distributed.run \
+  --nproc-per-node=1 examples/bridge/training/smoke_super_vl.py --vision
+```
+
+The probe uses random reduced language weights, checks local import provenance,
+native config serialization, forward/backward, native weight save/load, and
+Super VL's text-only safetensors projection. It downloads no model artifacts.
+It is **not** a full pretrained Super VL quality test, a convergence result,
+or validation of the unified `pretrain()` lifecycle.
+
+## Conversion entrypoint
+
+Use Bridge's existing `examples/bridge/conversion/convert.sh` and
+`examples/bridge/conversion/run_conversion.py`, copied from
+[`08035723`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/08035723e7a86f94fc54a7f4473bd0519f2ac941/scripts/conversion).
+The launcher changes only repository-root/import paths. Its conversion workers
+are retained; this branch supplies their model/conversion dependencies inside MLM.
+The older `examples/bridge/conversion/convert_checkpoint.py` is retained only as a historical
+prototype, not the entrypoint used for the comparison below.
+
+The native output stores `model`/`modelN` weights,
+checkpoint version/iteration and MLM's `run_config.yaml`, publishing the tracker
+only after successful save. It does not install global training args.
+
+For an already accessible HF checkpoint, using an appropriately sized GPU job:
+
+```bash
+PYTHONPATH=. uv run --no-project python -m torch.distributed.run \
+  --nproc-per-node=8 examples/bridge/conversion/run_conversion.py import --device gpu \
+  --hf-model /models/super-vl --megatron-path /checkpoints/super-vl \
+  --tp 2 --ep 8 --etp 1 --trust-remote-code
+
+# Same source, but import only its language weights:
+PYTHONPATH=. uv run --no-project python -m torch.distributed.run \
+  --nproc-per-node=8 examples/bridge/conversion/run_conversion.py import --device gpu \
+  --hf-model /models/super-vl --megatron-path /checkpoints/super-text \
+  --tp 2 --ep 8 --etp 1 --trust-remote-code --text-only
+
+PYTHONPATH=. uv run --no-project python -m torch.distributed.run \
+  --nproc-per-node=8 examples/bridge/conversion/run_conversion.py export --device gpu \
+  --hf-model /models/super-vl --megatron-path /checkpoints/super-text \
+  --hf-path /exports/super-text --tp 2 --ep 8 --etp 1 --trust-remote-code --text-only
+```
+
+GPU counts above are illustrative, not a measured capacity recommendation.
+The public source is `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`.
+Use a pinned `--hf-revision` for a Hub source. `--trust-remote-code` is
+an explicit opt-in. Native HF Super VL configs require
+Transformers >=5.18; older environments need the original remote-code config.
+
+Initial scope is builder-backed `torch_dist` weights only. Legacy args/provider
+reconstruction, optimizer/resume state, ModelOpt checkpoint transforms, PEFT
+checkpoint I/O and destructive low-memory saves are not supported. Loading
+preserves saved topology unless explicit overrides are supplied. Full-scale
+pretrained conversion, multi-rank conversion and training-loop integration
+remain validation work, not claims made by the reduced probe.
+
+## Existing-script comparison (2026-11-08)
+
+Reference: Bridge `08035723e7a86f94fc54a7f4473bd0519f2ac941`. Candidate:
+this MLM-only tree. Both use the same MLM Core and cached NeMo 26.08.rc9
+environment, with separate Python import paths and checkpoint directories.
+No Bridge training package is imported by the candidate.
+
+- Reduced Nemotron-H with Mamba, attention, MoE and MTP: existing GPU import and
+  export scripts pass on both sides. All 52 tensors match the original fixture
+  exactly, including dtype; exported config and tokenizer match between arms.
+- Super VL with the public model's full RADIO configuration and a tiny Hybrid
+  language model: both imports/exports pass. All 446 exported tensors match
+  exactly between arms. This includes all 445 source tensors plus the same
+  deterministic RADIO summary-index buffer added by the existing exporter.
+  Exported config and tokenizer also match between arms.
+- Text-only conversion from that same VL fixture: both scripts pass, with all
+  52 language tensors matching the source projection exactly, and matching
+  exported config/tokenizer.
+- Repeating that text-only import/export on two GPUs with TP=2, EP=2, ETP=1
+  also passes on both sides: all 52 tensors, config and tokenizer match exactly.
+- `convert.sh` local GPU import passes. An offline container without a resolvable
+  hostname needs `PET_LOCAL_ADDR=127.0.0.1` for the existing torchrun rendezvous.
+- The comparison exposed one prototype loader bug: reverse HF translation needs
+  model-specific `from_dict()` to restore activation callables, not generic
+  instantiation alone. The loader now follows Bridge's reconstruction path while
+  preserving recursive target allowlist checks.
+
+The reference uses Bridge checkpoint metadata and the candidate uses MLM
+`run_config.yaml`; checkpoint directories are not expected to be byte-identical.
+The equivalence gate is exported tensor keys, shapes, dtypes and values, plus
+exported model config and tokenizer. These are reduced-model conversion results,
+not pretrained full-size forward parity. Distributed CPU, PP repartitioning and
+full-size conversion remain unverified. The full-size source is pinned to
+`fb0ee0bc6b3f70342afd8d84cb80dbadbaa8a1fe`.
+
+## Qwen Hybrid pipeclean (2026-11-09)
+
+Targets are `Qwen/Qwen3.5-35B-A3B` at
+`59d61f3ce65a6d9863b86d2e96597125219dc754` and `Qwen/Qwen3.8-27B` at
+`37561816e66b5b9153b1b64c10968c18c1e6f4a0`. Both checkpoints contain vision
+encoders; the latter has a dense language model, not an MoE model. Both use
+the Qwen 3.5 Hybrid implementation in Bridge `0f0620592`.
+
+Use the existing conversion entrypoints, for example:
+
+```bash
+./examples/bridge/conversion/convert.sh import --device gpu --gpus-per-node 4 \
+  --hf-model Qwen/Qwen3.5-35B-A3B \
+  --hf-revision 59d61f3ce65a6d9863b86d2e96597125219dc754 \
+  --megatron-path /checkpoints/qwen35 --tp 2 --ep 4 --etp 1
+
+./examples/bridge/conversion/convert.sh export --device gpu --gpus-per-node 4 \
+  --hf-model Qwen/Qwen3.5-35B-A3B \
+  --hf-revision 59d61f3ce65a6d9863b86d2e96597125219dc754 \
+  --megatron-path /checkpoints/qwen35 --hf-path /exports/qwen35 \
+  --tp 2 --ep 4 --etp 1 --export-weight-dtype bfloat16
+```
+
+For Qwen 3.8, substitute its model ID/revision and use `--tp 4 --ep 1 --etp 4`.
+Set `--export-weight-dtype bfloat16` explicitly when comparing: current Bridge's
+native checkpoint reload otherwise exports FP32 here, whereas this weights-only
+MLM adapter preserves BF16. The Qwen VL bridges do not implement `--text-only`
+projection in the pinned Bridge version; the port preserves that limitation.
+
+Reduced fixtures retain vision, GDN/attention blocks, MTP, and dense/MoE layers.
+The single-GPU Qwen 3.5 (174 tensors) and Qwen 3.8 (104 tensors) import/export
+results match source weights and latest Bridge exports exactly, including dtype,
+config and tokenizer. Qwen 3.5 with the published packed-expert layout also
+passes TP=2/EP=2/ETP=1 (134 tensors); Qwen 3.8 also passes TP=2 (104 tensors).
+Image-conditioned forward/backward with the diagnostic Torch GDN kernel matches
+Bridge exactly for per-token losses and all gradients (136 MoE / 86 dense),
+including the vision encoder and MTP. Candidate module provenance is checked and
+PEFT imports are blocked. These are reduced-model checks, not pretrained
+HF/MCore logit parity or unified `pretrain()` validation.
+
+Full pretrained Qwen 3.5 import/export also passes on four H100s with
+TP=2/EP=4/ETP=1. All 1,811 exported tensors match exactly between Bridge and
+MLM, with no missing or extra tensors, identical exported model config, and
+byte-identical tokenizer files. Both arms explicitly export BF16: 60 source
+FP32 tensors are cast to BF16, and every exported tensor matches the source
+after this requested cast. This is not a claim of lossless FP32 preservation.
+Full pretrained Qwen 3.8 also passes on four H100s with TP=4/EP=1/ETP=4:
+all 1,199 exported tensors match the source and Bridge exactly, including dtype,
+with no missing/extra tensors and identical exported config/tokenizer. No source
+dtype casts are needed for this checkpoint. Both full-size comparisons use the
+same NeMo 26.10.rc5 environment and MLM Core revision for both arms. The tested
+candidate code is `f8537ea2936f916799f5754425aa1b97581b16db`; native checkpoint
+metadata differs by design, so equivalence is checked through HF export.
+Full pretrained forward/logit parity, unified training, and performance remain
+unverified.
+
+## Cross-PR integration adjustments
+
+- Preserve model-owned topology, tokenizer-owned padded vocabulary and the
+  config finalization/validation separation.
+- Use dataset sample length rather than position capacity or stale CLI values
+  for the combined TP-buffer, JIT, FLOP and memory-estimate consumers.
+- Preserve class-selected builders when deserializing configs.
+- Keep ModelOpt transformations on stock GPT/Hybrid builders. Teacher checkpoint
+  reads use an isolated operation policy, including the inner metadata/read
+  calls, so student step/non-persistent selectors do not leak into them.
+- Adapt existing targeted fixtures to the combined contracts; no per-config
+  synthetic ownership-test files were introduced.
+
+## Initial validation (2026-11-06)
+
+Using the cached NeMo `26.08.rc9` environment with network access disabled:
+
+- 913 targeted tests passed; 314 skipped in the single-GPU configuration. This
+  selection covers config finalization/serialization, model builders, dataset
+  ownership/batching, checkpoint policy, ModelOpt and runtime initialization.
+  It is neither the full unit suite nor the fork-only argument seam suite.
+- The offline probe passed native config round-trip, reduced Mamba/attention/MoE
+  forward/backward and exact native save/load of all 46 parameter tensors.
+- Super VL's text-only projection passed HF safetensors export/import with exact
+  parameter comparison, using locally generated random weights.
+- Full RADIO plus projector and a reduced language model (653,647,564 total
+  parameters) passed a random-image forward with output shape `(1, 16, 256)`.
+- Independent integration and port reviews were completed and findings fixed.
+  Scoped import sorting, formatting and undefined-name checks pass. All-files
+  pre-commit still reports unrelated baseline formatting/Core Pylint findings;
+  these were not copied into this experiment.
+
+These checks do not establish pretrained HF/MCore forward parity, full-size
+120B conversion, multi-rank behavior, or unified `pretrain()` execution.
