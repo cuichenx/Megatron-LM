@@ -182,8 +182,23 @@ Image-conditioned forward/backward with the diagnostic Torch GDN kernel matches
 Bridge exactly for per-token losses and all gradients (136 MoE / 86 dense),
 including the vision encoder and MTP. Candidate module provenance is checked and
 PEFT imports are blocked. These are reduced-model checks, not pretrained
-HF/MCore logit parity or unified `pretrain()` validation. Full-size checkpoint
-comparisons are running; no full-size Qwen result is claimed yet.
+HF/MCore logit parity or unified `pretrain()` validation.
+
+Full pretrained Qwen 3.5 import/export also passes on four H100s with
+TP=2/EP=4/ETP=1. All 1,811 exported tensors match exactly between Bridge and
+MLM, with no missing or extra tensors, identical exported model config, and
+byte-identical tokenizer files. Both arms explicitly export BF16: 60 source
+FP32 tensors are cast to BF16, and every exported tensor matches the source
+after this requested cast. This is not a claim of lossless FP32 preservation.
+Full pretrained Qwen 3.8 also passes on four H100s with TP=4/EP=1/ETP=4:
+all 1,199 exported tensors match the source and Bridge exactly, including dtype,
+with no missing/extra tensors and identical exported config/tokenizer. No source
+dtype casts are needed for this checkpoint. Both full-size comparisons use the
+same NeMo 26.10.rc5 environment and MLM Core revision for both arms. The tested
+candidate code is `f8537ea2936f916799f5754425aa1b97581b16db`; native checkpoint
+metadata differs by design, so equivalence is checked through HF export.
+Full pretrained forward/logit parity, unified training, and performance remain
+unverified.
 
 ## Cross-PR integration adjustments
 
