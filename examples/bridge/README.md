@@ -1,4 +1,4 @@
-# [DO NOT MERGE] Training-loop / Super VL integration experiment
+# [DO NOT MERGE] Training-loop / model conversion experiment
 
 This fork branch combines the following **pinned** changes. It is not a proposal
 to merge these PRs as one patch, and does not change their original branches.
@@ -13,7 +13,7 @@ to merge these PRs as one patch, and does not change their original branches.
 | #8340 — ModelOpt builders | `8a9e22443ff30b5be187d3a40ee4719f68576aa5` |
 | #8444 — VLM inputs | `b3d041b74c9b8047ea1890a2a2a1a5d4f5eef48e` |
 
-## Narrow Bridge port
+## Model conversion port
 
 `megatron/bridge` contains the native `Nemotron35SuperVLBridge`, its Nemotron-H
 text-only projection, model builders, AutoBridge and the shared conversion
@@ -21,7 +21,14 @@ dependency closure. The source is Apache-2.0 Megatron Bridge at
 [`53c20f81`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/53c20f81cb575f19af34ff0ae1749fb13b07999b).
 Copied files carry source links and notices.
 
-Only Super VL and Nemotron-H are registered. No other Omni variant, audio
+The Qwen 3.5/3.8 dense and MoE text/VL bridges and their model components are
+ported from latest Bridge
+[`0f0620592`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/commit/0f06205924d4e19b0723aa8c33e34a1959ca17fe),
+including its Qwen 3.5 Hybrid migration. Qwen VL uses the native Hybrid language
+decoder plus the shared Qwen vision encoder. Deprecated provider and
+token-classification paths are not included.
+
+Super VL, Nemotron-H, and these Qwen bridges are registered. No other Omni variant, audio
 encoder, MIMO model, recipe library or Bridge training loop is imported. The
 shared expanded-sequence model still contains dormant optional audio handling;
 there is no supported audio construction path in this port. Shared conversion
@@ -136,6 +143,47 @@ exported model config and tokenizer. These are reduced-model conversion results,
 not pretrained full-size forward parity. Distributed CPU, PP repartitioning and
 full-size conversion remain unverified. The full-size source is pinned to
 `fb0ee0bc6b3f70342afd8d84cb80dbadbaa8a1fe`.
+
+## Qwen Hybrid pipeclean (2026-11-09)
+
+Targets are `Qwen/Qwen3.5-35B-A3B` at
+`59d61f3ce65a6d9863b86d2e96597125219dc754` and `Qwen/Qwen3.8-27B` at
+`37561816e66b5b9153b1b64c10968c18c1e6f4a0`. Both checkpoints contain vision
+encoders; the latter has a dense language model, not an MoE model. Both use
+the Qwen 3.5 Hybrid implementation in Bridge `0f0620592`.
+
+Use the existing conversion entrypoints, for example:
+
+```bash
+./examples/bridge/conversion/convert.sh import --device gpu --gpus-per-node 4 \
+  --hf-model Qwen/Qwen3.5-35B-A3B \
+  --hf-revision 59d61f3ce65a6d9863b86d2e96597125219dc754 \
+  --megatron-path /checkpoints/qwen35 --tp 2 --ep 4 --etp 1
+
+./examples/bridge/conversion/convert.sh export --device gpu --gpus-per-node 4 \
+  --hf-model Qwen/Qwen3.5-35B-A3B \
+  --hf-revision 59d61f3ce65a6d9863b86d2e96597125219dc754 \
+  --megatron-path /checkpoints/qwen35 --hf-path /exports/qwen35 \
+  --tp 2 --ep 4 --etp 1 --export-weight-dtype bfloat16
+```
+
+For Qwen 3.8, substitute its model ID/revision and use `--tp 4 --ep 1 --etp 4`.
+Set `--export-weight-dtype bfloat16` explicitly when comparing: current Bridge's
+native checkpoint reload otherwise exports FP32 here, whereas this weights-only
+MLM adapter preserves BF16. The Qwen VL bridges do not implement `--text-only`
+projection in the pinned Bridge version; the port preserves that limitation.
+
+Reduced fixtures retain vision, GDN/attention blocks, MTP, and dense/MoE layers.
+The single-GPU Qwen 3.5 (174 tensors) and Qwen 3.8 (104 tensors) import/export
+results match source weights and latest Bridge exports exactly, including dtype,
+config and tokenizer. Qwen 3.5 with the published packed-expert layout also
+passes TP=2/EP=2/ETP=1 (134 tensors); Qwen 3.8 also passes TP=2 (104 tensors).
+Image-conditioned forward/backward with the diagnostic Torch GDN kernel matches
+Bridge exactly for per-token losses and all gradients (136 MoE / 86 dense),
+including the vision encoder and MTP. Candidate module provenance is checked and
+PEFT imports are blocked. These are reduced-model checks, not pretrained
+HF/MCore logit parity or unified `pretrain()` validation. Full-size checkpoint
+comparisons are running; no full-size Qwen result is claimed yet.
 
 ## Cross-PR integration adjustments
 
