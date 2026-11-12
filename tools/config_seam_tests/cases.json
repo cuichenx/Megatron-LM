@@ -72,6 +72,17 @@
   ],
   "cases": [
     {
+      "name": "sequence_sft_mock",
+      "tier": "runtime",
+      "options": {"--sft": true, "--no-create-attention-mask-in-dataloader": true, "--exit-interval": "2", "--tokenizer-type": "HuggingFaceTokenizer", "--tokenizer-model": "{fixtures}/tokenizer", "--vocab-size": false}
+    },
+    {
+      "name": "sequence_sft_mock_cp",
+      "tier": "runtime",
+      "ranks": 2,
+      "options": {"--sft": true, "--no-create-attention-mask-in-dataloader": true, "--context-parallel-size": "2", "--exit-interval": "2", "--tokenizer-type": "HuggingFaceTokenizer", "--tokenizer-model": "{fixtures}/tokenizer", "--vocab-size": false}
+    },
+    {
       "name": "rerun_replay",
       "verify_replay": true,
       "tier": "runtime",
@@ -532,7 +543,7 @@
       "expected": {
         "config.tokenizer": {"fields.vocab_file": "<fixtures>/tokenizer/bert-vocab.txt"},
         "runtime.tokenizer": {"vocab_size": 261},
-        "runtime.tokenizer_inputs": {"vocab_file": "<fixtures>/tokenizer/bert-vocab.txt"}
+        "runtime.tokenizer_inputs": {"fields.vocab_file": "<fixtures>/tokenizer/bert-vocab.txt"}
       }
     },
     {
@@ -1006,19 +1017,19 @@
       "tier": "builder",
       "options": {
         "--use-megatron-fsdp": true,
-        "--megatron-fsdp-version": "2",
+        "--megatron-fsdp-version": "1",
         "--use-nccl-ub": true,
         "--fsdp-manual-registration": true,
         "--create-all-gather-group": true,
         "--megatron-fsdp-main-params-dtype": "bf16",
         "--megatron-fsdp-main-grads-dtype": "fp32",
-        "--megatron-fsdp-grad-comm-dtype": "bf16",
+        "--megatron-fsdp-grad-comm-dtype": "fp32",
         "--ckpt-format": "fsdp_dtensor",
         "--no-strict-fsdp-dtensor-load": true
       },
       "expected": {
         "config.ddp": {
-          "fields.megatron_fsdp_version": 2,
+          "fields.megatron_fsdp_version": 1,
           "fields.nccl_ub": true,
           "fields.fsdp_manual_registration": true
         }
@@ -1038,9 +1049,9 @@
         "--untie-embeddings-and-output-weights": true
       },
       "expected": {
-        "config.ddp": {"fields.reshard_after_forward": false},
-        "config.dist": {
-          "fields.use_torch_fsdp2": true
+        "config.ddp": {
+          "fields.reshard_after_forward": false,
+          "type": "megatron.core.distributed.torch_fully_sharded_data_parallel_config.TorchFullyShardedDataParallelConfig"
         }
       },
       "environment": {

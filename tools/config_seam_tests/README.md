@@ -8,7 +8,9 @@ and does not need to land in MLM main.
 The coverage expansion adds 58 `coverage_*` scenarios and expected-value
 assertions. Together with the retained Hybrid TE-tracker case and real multimodal
 startup case, the PR7778 matrix has 112 cases. A subsequent `--test-mode` builder
-case brings the current manifest to 113 cases. See [the expansion inventory](EXPANSION.md)
+case brought that manifest to 113 cases. Subsequent rerun/straggler and packed-SFT
+coverage brings the current manifest to 118 cases. See the
+[sequence-length comparison](SEQUENCE_LENGTH_RESULTS.md), [the expansion inventory](EXPANSION.md)
 for scope and historical input counts, [the PR8149 report](TRAIN_VALIDATION_RESULTS.md)
 for the current training/validation comparison, and [the PR7778 report](DIST_RESULTS.md)
 for the earlier distributed-config comparison. Earlier result documents still

@@ -52,7 +52,15 @@ def main() -> None:
     result = {"schema": 1, "case": case["name"], "tier": case["tier"], "rank": rank, "captures": {}, "status": "error"}
 
     def record(name, value, references=None):
-        result["captures"].setdefault(name, []).append(encode(value, roots, references))
+        encoded = encode(value, roots, references)
+        if name == "consumer.dataset" and isinstance(value, GPTDatasetConfig):
+            # Preserve every dataset field and compare the effective physical width.
+            # Before the split, sequence_length also determined SFT's output width.
+            fields = encoded["fields"]
+            fields["packed_sequence_length"] = (
+                fields.get("packed_sequence_length") or fields["sequence_length"]
+            )
+        result["captures"].setdefault(name, []).append(encoded)
 
     def observe_call(owner, name, capture_name, excluded=(), after=None, included=None):
         original = getattr(owner, name)
@@ -127,13 +135,6 @@ def main() -> None:
 
         globals_._build_tokenizer = tokenizer
         observe_call(training, "OptimizerParamScheduler", "consumer.scheduler", excluded=("optimizer",))
-        original_dataset_post_init = GPTDatasetConfig.__post_init__
-
-        def dataset_post_init(self):
-            original_dataset_post_init(self)
-            record("consumer.dataset", self)
-
-        GPTDatasetConfig.__post_init__ = dataset_post_init
         original_pretrain = training.pretrain
 
         def capture_entry(cfg, dataset_provider, *args, **kwargs):
@@ -207,7 +208,10 @@ def main() -> None:
                 return
             # Builder tier: execute the real dataset builder and scheduler derivation,
             # but do NOT claim model/optimizer/DDP construction or checkpoint I/O.
-            build_dataset_config(dataset_provider, cli)
+            if getattr(cfg, "data", None) is not None and cfg.data.dataset is not None:
+                record("consumer.dataset", cfg.data.dataset)
+            else:
+                record("consumer.dataset", build_dataset_config(dataset_provider, cli))
             optimizer = SimpleNamespace(param_groups=[{"default_config": True}, {"wd_mult": 0.0}])
             scheduler = training.get_optimizer_param_scheduler(optimizer)
             for target in sorted(
@@ -272,9 +276,23 @@ def main() -> None:
             from torch.utils.tensorboard import SummaryWriter
 
             from megatron.core import tensor_parallel
+            from megatron.core.datasets.blended_megatron_dataset_builder import (
+                BlendedMegatronDatasetBuilder,
+            )
             from megatron.core.rerun_state_machine import RerunDataIterator, RerunStateMachine
             from megatron.training import initialize
             from megatron.training.datasets import data_samplers
+
+            original_dataset_init = BlendedMegatronDatasetBuilder.__init__
+            dataset_signature = inspect.signature(original_dataset_init)
+
+            @functools.wraps(original_dataset_init)
+            def dataset_init(*args, **kwargs):
+                inputs = dataset_signature.bind(*args, **kwargs)
+                record("consumer.dataset", inputs.arguments["config"])
+                return original_dataset_init(*args, **kwargs)
+
+            BlendedMegatronDatasetBuilder.__init__ = dataset_init
 
             original_rerun_init = initialize.initialize_rerun_state_machine
 
