@@ -21,6 +21,7 @@ from megatron.core.num_microbatches_calculator import (
     unset_num_microbatches_calculator,
 )
 from megatron.training.dist_signal_handler import DistributedSignalHandler
+from megatron.training.sequence_lengths import get_dataset_input_length, get_model_input_length
 from megatron.training.state import TrainState
 
 _GLOBAL_ARGS = None
@@ -227,6 +228,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         from megatron.training.utils import print_rank_0
         print_rank_0(f'> using step batch size schedule: {cfg.train.step_batch_size_schedule}')
 
+    dataset = cfg.data.dataset
     init_num_microbatches_calculator(
         rank=args.rank,
         global_batch_size=cfg.train.global_batch_size,
@@ -235,7 +237,11 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         data_parallel_size=cfg.get_batch_parallel_size(),
         decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
         step_batch_size_schedule=cfg.train.step_batch_size_schedule,
-        seq_length=args.seq_length,
+        seq_length=(
+            get_dataset_input_length(dataset)
+            if dataset is not None
+            else get_model_input_length(cfg.model)
+        ),
     )
     _set_tensorboard_writer(args)
     _set_one_logger(args)
@@ -571,7 +577,6 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     cfg = get_run_config()
     resource_attrs = {'dl.local_rank': cfg.dist.local_rank}
     fields = [
-        ('dl.sequence_length', 'seq_length'),
         ('megatron.ckpt_format', 'ckpt_format'),
     ]
     if include_training:
@@ -590,6 +595,18 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
         val = getattr(args, arg_name, None)
         if val is not None:
             resource_attrs[attr] = val
+    # Loader telemetry describes dataset rows, not VLM's expanded model input.
+    if include_training:
+        dataset = cfg.data.dataset
+        sequence_length = (
+            get_dataset_input_length(dataset)
+            if dataset is not None
+            else get_model_input_length(cfg.model)
+        )
+    else:
+        sequence_length = getattr(args, 'seq_length', None)
+    if sequence_length is not None:
+        resource_attrs['dl.sequence_length'] = sequence_length
 
     # Preserve inference's CLI boundary; training's existing model tags use its config owner.
     if include_training:
