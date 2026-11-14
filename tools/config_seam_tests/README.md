@@ -9,7 +9,8 @@ The coverage expansion adds 58 `coverage_*` scenarios and expected-value
 assertions. Together with the retained Hybrid TE-tracker case and real multimodal
 startup case, the PR7778 matrix has 112 cases. A subsequent `--test-mode` builder
 case brought that manifest to 113 cases. Subsequent rerun/straggler and packed-SFT
-coverage brings the current manifest to 118 cases. See the
+coverage brought the manifest to 118 cases; the dataset-family split adds a Varlen
+runtime-packing case, bringing the current manifest to 119. See the
 [sequence-length comparison](SEQUENCE_LENGTH_RESULTS.md), [the expansion inventory](EXPANSION.md)
 for scope and historical input counts, [the PR8149 report](TRAIN_VALIDATION_RESULTS.md)
 for the current training/validation comparison, and [the PR7778 report](DIST_RESULTS.md)

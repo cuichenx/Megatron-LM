@@ -83,6 +83,11 @@
       "options": {"--sft": true, "--no-create-attention-mask-in-dataloader": true, "--context-parallel-size": "2", "--exit-interval": "2", "--tokenizer-type": "HuggingFaceTokenizer", "--tokenizer-model": "{fixtures}/tokenizer", "--vocab-size": false}
     },
     {
+      "name": "sequence_varlen_mock",
+      "tier": "runtime",
+      "options": {"--use-varlen-dataset": true, "--calculate-per-token-loss": true, "--sequence-packing-scheduler": "dp_balanced", "--max-seqlen-per-dp-cp-rank": "64", "--no-create-attention-mask-in-dataloader": true, "--exit-interval": "2", "--tokenizer-type": "HuggingFaceTokenizer", "--tokenizer-model": "{fixtures}/tokenizer", "--vocab-size": false}
+    },
+    {
       "name": "rerun_replay",
       "verify_replay": true,
       "tier": "runtime",

@@ -1,5 +1,52 @@
 # Sequence-length ownership: pinned before/after comparison
 
+## Dataset-family config follow-up (2026-11-14)
+
+Compared the previously published #9375 head
+`a408982db19450e69dfdad013b058584490e0e66` with the dataset-family split at
+`262b523d8a9b28d8477fadb7e5064c0717a9dc13`, using cached NeMo 26.08.rc9 on
+two RTX 6000 Ada GPUs. Subsequent published head
+`954986b40e781da6c61d0346fe75ada810a46501` adds formatting and shared-base type
+annotations only; the comparisons are pinned to the functional commit above.
+
+All **11 selected cases completed without execution/capture errors**. Every
+captured runtime input, training metric, RNG state, and non-dataset config matched.
+Resume used the same checkpoint produced by the baseline. This was a targeted
+follow-up, not a rerun of the full matrix below.
+
+The raw comparator reports 11 schema mismatches (exit 1), not 11 exact passes:
+
+- Indexed GPT/FIM no longer carry four online-padding fields, two mock-family
+  settings, or the Varlen SBHD flag: seven removals per rank.
+- SFT no longer carries ten indexed-GPT fields or the two Varlen settings:
+  twelve removals per rank, including both ranks of the CP case.
+- Varlen uses `VarlenDatasetConfig`, dropping ten indexed-GPT fields and the SFT
+  mock setting. It also no longer receives the observer's synthetic
+  `packed_sequence_length` field (previously added for every GPT config).
+
+All 105 raw differences were checked against those explicit schema changes;
+none were suppressed by the harness. The new `sequence_varlen_mock` case executes
+runtime packing with `dp_balanced`; the manifest now contains 119 cases.
+
+Reproduce from this directory with clean checkouts at the pinned revisions:
+
+```bash
+uv run --no-sync python compare_config_seams.py \
+  --baseline /path/to/before --candidate /path/to/after \
+  --baseline-revision a408982db19450e69dfdad013b058584490e0e66 \
+  --candidate-revision 262b523d8a9b28d8477fadb7e5064c0717a9dc13 \
+  --environment-id YOUR_IMAGE --output /path/to/new-results \
+  --cases defaults runtime_fresh runtime_resume \
+    sequence_sft_mock sequence_sft_mock_cp sequence_varlen_mock \
+    coverage_dataset_workers_cyclic coverage_dataset_cache_config \
+    coverage_dataset_masks_runtime coverage_dataset_inter_document_config \
+    coverage_dataset_fim_config
+```
+
+The comparison suite runs capture/compare workloads only, not unit tests.
+
+## Earlier full-matrix validation
+
 Validated on 2026-11-12 against one frozen main revision:
 
 - Baseline: `a7a6d2225700a8ee701453288894501d868c6bd4`.
